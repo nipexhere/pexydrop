@@ -18,6 +18,11 @@ const maxFailedJoins = 8
 // A pairing code outlives a brief disconnect, such as a phone locking its screen.
 const roomGraceMs = 2 * 60_000
 
+const stunServers = [{ urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] }]
+const cloudflareKeyId = process.env.CLOUDFLARE_TURN_KEY_ID
+const cloudflareToken = process.env.CLOUDFLARE_TURN_API_TOKEN
+let turnCache = { servers: /** @type {object[] | null} */ (null), expires: 0 }
+
 /** @type {Map<string, Set<Peer>>} */
 const rooms = new Map()
 /** @type {Map<import('ws').WebSocket, Peer>} */
@@ -27,6 +32,38 @@ const peersBySocket = new Map()
  * @typedef {{ id: string, name: string, device: string, detail: string, socket: import('ws').WebSocket,
  *   networkRoom: string, codeRoom: string | null, failedJoins: number, alive: boolean }} Peer
  */
+
+// A TURN relay forwards the still-encrypted data when two devices on different
+// networks can't reach each other directly. It is optional; without one, PexyDrop
+// only makes direct connections.
+async function iceServers() {
+  const { TURN_URLS, TURN_USERNAME, TURN_CREDENTIAL } = process.env
+  if (TURN_URLS && TURN_USERNAME && TURN_CREDENTIAL) {
+    return [...stunServers, { urls: TURN_URLS.split(',').map((url) => url.trim()).filter(Boolean), username: TURN_USERNAME, credential: TURN_CREDENTIAL }]
+  }
+  if (!cloudflareKeyId || !cloudflareToken) return stunServers
+  if (turnCache.servers && Date.now() < turnCache.expires) return turnCache.servers
+  try {
+    const response = await fetch(`https://rtc.live.cloudflare.com/v1/turn/keys/${cloudflareKeyId}/credentials/generate-ice-servers`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${cloudflareToken}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ttl: 86_400 }),
+      signal: AbortSignal.timeout(5000),
+    })
+    if (!response.ok) throw new Error(`Cloudflare TURN responded ${response.status}`)
+    const { iceServers: servers } = await response.json()
+    // Browsers block port 53, so those URLs would only slow connection setup.
+    const usable = servers.map((server) => ({
+      ...server,
+      urls: [server.urls].flat().filter((url) => !/:53(\?|$)/.test(url)),
+    }))
+    turnCache = { servers: [...stunServers, ...usable], expires: Date.now() + 12 * 60 * 60_000 }
+  } catch (error) {
+    console.warn('Could not get TURN credentials, using direct connections only:', error.message)
+    turnCache = { servers: stunServers, expires: Date.now() + 60_000 }
+  }
+  return turnCache.servers
+}
 
 function lanAddresses() {
   return Object.entries(os.networkInterfaces())
@@ -204,9 +241,12 @@ wss.on('connection', (socket, request) => {
       peer.name = cleanName(message.name)
       peer.device = cleanDevice(message.device)
       peer.detail = cleanText(message.detail)
-      joinRoom(peer, peer.networkRoom)
-      send(peer, { type: 'welcome', id: peer.id })
-      broadcastRooms(peer.networkRoom)
+      void iceServers().then((servers) => {
+        if (socket.readyState !== socket.OPEN || peersBySocket.get(socket) !== peer) return
+        joinRoom(peer, peer.networkRoom)
+        send(peer, { type: 'welcome', id: peer.id, iceServers: servers })
+        broadcastRooms(peer.networkRoom)
+      })
       return
     }
     if (!introduced) return
@@ -277,6 +317,7 @@ setInterval(() => {
 
 server.listen(port, isDev ? '127.0.0.1' : '0.0.0.0', () => {
   console.log(`PexyDrop ready on port ${port}`)
+  console.log(process.env.TURN_URLS || cloudflareKeyId ? '  Relay (TURN) enabled for devices on different networks' : '  No relay configured: devices connect directly only')
   if (!behindProxy && !isDev) {
     for (const address of lanAddresses()) console.log(`  On your Wi-Fi: http://${address}:${port}`)
   }

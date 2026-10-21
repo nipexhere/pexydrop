@@ -1,0 +1,19 @@
+# Render's free plan sleeps after 15 idle minutes, and the first visit then takes
+# up to a minute. Pinging every 10 minutes keeps it awake. One always-on free
+# service uses about 744 of the 750 free instance hours Render gives each month.
+name: Keep Render awake
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Ping PexyDrop
+        run: curl --fail --silent --show-error --retry 3 --max-time 90 "${SITE_URL}/api/info" > /dev/null
+        env:
+          SITE_URL: ${{ vars.PEXYDROP_URL || 'https://pexydrop.onrender.com' }}

@@ -248,6 +248,44 @@ h1 span { color: var(--secondary); background: linear-gradient(90deg, var(--seco
 .toast { position: fixed; z-index: 30; bottom: max(20px, env(safe-area-inset-bottom)); left: 50%; transform: translateX(-50%); width: max-content; max-width: calc(100vw - 32px); display: flex; align-items: center; gap: 10px; padding: 11px 12px 11px 16px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); box-shadow: 0 10px 30px rgba(0, 0, 0, .16); color: var(--ink-soft); font-size: 14px; animation: toast-in .2s both; }
 .toast button { width: 26px; height: 26px; flex: 0 0 26px; display: grid; place-items: center; border: 0; border-radius: 6px; background: transparent; color: var(--muted); }
 
+.queue-chip { margin-top: 6px; padding: 2px 8px; border-radius: 99px; color: var(--secondary-ink); background: var(--secondary-soft); font: 500 11px var(--mono); }
+.foot-actions { display: inline-flex; align-items: center; gap: 6px; }
+.trust-chip { display: inline-flex; align-items: center; gap: 4px; padding: 5px 7px; border: 0; border-radius: 7px; color: var(--primary-ink); background: var(--primary-soft); font: 500 11px var(--mono); }
+.trust-chip:hover { color: var(--danger); background: var(--danger-soft); }
+.hotspot-tip { max-width: 420px; display: flex; gap: 10px; margin-top: 22px; padding: 12px 14px; border-radius: 10px; color: var(--ink-soft); background: var(--secondary-soft); font-size: 13px; line-height: 1.5; text-align: left; }
+.hotspot-tip strong { color: var(--ink); font: inherit; font-weight: 700; }
+.hotspot-tip svg { flex: 0 0 auto; margin-top: 2px; color: var(--secondary-ink); }
+.saved-tag { display: inline-flex; align-items: center; gap: 5px; max-width: 40%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--primary-ink); font-size: 12px; font-weight: 600; }
+
+.history { margin-top: 30px; border-top: 1px solid var(--line); }
+.history summary { display: flex; align-items: center; gap: 9px; padding: 16px 0; color: var(--ink-soft); font: 700 15px var(--display); cursor: pointer; list-style: none; }
+.history summary::-webkit-details-marker { display: none; }
+.history summary::after { content: ''; width: 7px; height: 7px; margin-left: auto; border-right: 2px solid var(--faint); border-bottom: 2px solid var(--faint); transform: rotate(45deg); transition: transform .2s; }
+.history[open] summary::after { transform: rotate(-135deg); }
+.history summary svg { color: var(--muted); }
+.history-list { padding-bottom: 8px; }
+.history-row { display: flex; align-items: center; gap: 12px; padding: 9px 0; }
+.history-icon { width: 30px; height: 30px; flex: 0 0 30px; display: grid; place-items: center; border-radius: 50%; color: var(--secondary-ink); background: var(--secondary-soft); }
+.history-icon.is-sent { color: var(--primary-ink); background: var(--primary-soft); }
+.history .file-meta p { font-size: 13px; }
+.history .text-button { margin: 8px 0 0; }
+
+.folder-row { display: flex; align-items: center; gap: 14px; padding-top: 14px; border-top: 1px solid var(--line); }
+.folder-row > span:first-child { flex: 1; min-width: 0; }
+.folder-row strong { display: block; font-size: 14px; }
+.folder-row small { display: block; margin-top: 3px; color: var(--muted); font-size: 12px; line-height: 1.45; overflow-wrap: anywhere; }
+.folder-row b { color: var(--ink-soft); }
+.folder-actions { display: inline-flex; align-items: center; gap: 4px; }
+.settings .toggle-row + .toggle-row { padding-top: 14px; border-top: 1px solid var(--line); }
+.folder-row + .toggle-row { padding-top: 14px; border-top: 1px solid var(--line); }
+
+.dialog-mark.is-warning { color: var(--amber); background: var(--amber-soft); }
+.dialog-tip { display: flex; gap: 8px; margin: 14px 0 0; padding: 10px 12px; border-radius: 9px; color: var(--ink-soft); background: var(--surface-tint); border: 1px solid var(--line); font-size: 13px; line-height: 1.5; }
+.dialog-tip svg { flex: 0 0 auto; margin-top: 2px; color: var(--secondary-ink); }
+.dialog-warning { display: flex; align-items: center; gap: 8px; margin: 12px 0 0; padding: 10px 12px; border-radius: 9px; color: var(--amber); background: var(--amber-soft); font-size: 13px; font-weight: 600; }
+.check-row { display: flex; align-items: flex-start; gap: 10px; margin-top: 16px; color: var(--ink-soft); font-size: 13px; line-height: 1.45; cursor: pointer; }
+.check-row input { width: 17px; height: 17px; flex: 0 0 17px; margin: 1px 0 0; accent-color: var(--primary); }
+
 @keyframes rise-in { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
 @keyframes toast-in { from { opacity: 0; transform: translate(-50%, 6px); } to { opacity: 1; transform: translate(-50%, 0); } }
 @keyframes fade-in { from { opacity: 0; } to { opacity: 1; } }

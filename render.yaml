@@ -6,6 +6,12 @@ services:
     buildCommand: npm ci && npm run build
     startCommand: npm start
     healthCheckPath: /api/info
+    autoDeploy: true
     envVars:
       - key: NODE_VERSION
         value: 24.21.0
+      # Optional relay for devices on different networks (see README).
+      - key: CLOUDFLARE_TURN_KEY_ID
+        sync: false
+      - key: CLOUDFLARE_TURN_API_TOKEN
+        sync: false

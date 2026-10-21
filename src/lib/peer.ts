@@ -11,6 +11,7 @@ export type Transfer = {
   transferred: number
   speed: number
   status: TransferStatus
+  toDisk?: boolean
   error?: string
 }
 
@@ -18,12 +19,18 @@ export type IncomingOffer = { id: string; peerId: string; files: FileMeta[]; tot
 
 export type LinkEvents = {
   transfer: (transfer: Transfer) => void
+  queued: (peerId: string, count: number) => void
   offer: (offer: IncomingOffer) => void
   offerWithdrawn: (offerId: string) => void
   file: (file: File, peerId: string) => void
+  saved: (meta: FileMeta, savedAs: string, peerId: string) => void
   text: (text: string, peerId: string) => void
   route: (peerId: string, route: Route | null) => void
 }
+
+// Asks the person whether a transfer may go over the internet (and so possibly
+// mobile data). Resolves true to go ahead.
+export type ConfirmInternet = (peerId: string, bytes: number) => Promise<boolean>
 
 type Control =
   | { t: 'offer'; id: string; files: FileMeta[]; total: number }
@@ -45,19 +52,28 @@ type Outgoing = {
   reject?: (error: Error) => void
 }
 
-type Incoming = { transfer: Transfer; index: number; chunks: ArrayBuffer[]; meter: Meter }
+type Incoming = {
+  transfer: Transfer
+  index: number
+  chunks: ArrayBuffer[]
+  meter: Meter
+  folder?: FileSystemDirectoryHandle
+  writer?: FileSystemWritableFileStream
+  savedAs?: string
+  // Disk writes are asynchronous but chunks arrive in order, so every step for a
+  // folder transfer runs through this chain.
+  chain: Promise<void>
+  failed: boolean
+}
 
 // 64 KiB messages are the largest size every browser's data channel accepts.
 const chunkSize = 64 * 1024
 const readSize = 1024 * 1024
+// Chrome closes a data channel whose send queue passes 16 MiB, so stay well below.
 const highWater = 8 * 1024 * 1024
 const lowWater = 1024 * 1024
 const connectTimeout = 20_000
-// STUN only reveals each device's public address so peers can find a path. No
-// relay (TURN) is configured, so file data can only travel device to device.
-const iceServers = [{ urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] }]
-
-export const wifiOnlyMessage = 'That device is not on your Wi-Fi. Join the same network, or turn off Wi-Fi only to send over the internet.'
+const defaultIceServers: RTCIceServer[] = [{ urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] }]
 
 export function makeId() {
   return Array.from(crypto.getRandomValues(new Uint8Array(8)), (byte) => byte.toString(16).padStart(2, '0')).join('')
@@ -70,6 +86,27 @@ function isPrivateAddress(address: string) {
 export function onCellular() {
   const connection = (navigator as Navigator & { connection?: { type?: string } }).connection
   return connection?.type === 'cellular'
+}
+
+function safeFileName(name: string) {
+  return name.replace(/[<>:"/\\|?*\u0000-\u001f]/g, '_').replace(/[. ]+$/, '') || 'file'
+}
+
+async function createUniqueFile(folder: FileSystemDirectoryHandle, name: string) {
+  const clean = safeFileName(name)
+  const dot = clean.lastIndexOf('.')
+  const base = dot > 0 ? clean.slice(0, dot) : clean
+  const extension = dot > 0 ? clean.slice(dot) : ''
+  for (let attempt = 0; attempt < 500; attempt += 1) {
+    const candidate = attempt ? `${base} (${attempt})${extension}` : clean
+    try {
+      await folder.getFileHandle(candidate)
+    } catch (error) {
+      if ((error as DOMException).name !== 'NotFoundError') throw error
+      return { handle: await folder.getFileHandle(candidate, { create: true }), name: candidate }
+    }
+  }
+  throw new Error('Too many files with that name in the folder.')
 }
 
 class Meter {
@@ -89,6 +126,17 @@ class Meter {
   }
 }
 
+type LinkOptions = {
+  selfId: string
+  peerId: string
+  iceServers: RTCIceServer[]
+  sendSignal: (data: Signal) => void
+  events: LinkEvents
+  askBeforeInternet: () => boolean
+  confirmInternet: ConfirmInternet
+  onClose: () => void
+}
+
 export class PeerLink {
   readonly session = makeId()
   remoteSession: string | null = null
@@ -100,27 +148,25 @@ export class PeerLink {
   private readonly pc: RTCPeerConnection
   private readonly channel: RTCDataChannel
   private readonly opened: Promise<void>
-  private readonly sendSignal: (data: Signal) => void
+  private readonly options: LinkOptions
   private readonly events: LinkEvents
-  private readonly wifiOnly: () => boolean
-  private readonly onClose: () => void
   private makingOffer = false
   private ignoreOffer = false
   private signalQueue = Promise.resolve()
   private rejectOpen: (error: Error) => void = () => {}
   private wakeSender: (() => void) | null = null
+  private sendQueue: File[][] = []
+  private pumping = false
   private outgoing: Outgoing | null = null
   private incoming: Incoming | null = null
   private pendingOffer: IncomingOffer | null = null
 
-  constructor(selfId: string, peerId: string, sendSignal: (data: Signal) => void, events: LinkEvents, wifiOnly: () => boolean, onClose: () => void) {
-    this.peerId = peerId
-    this.polite = selfId > peerId
-    this.sendSignal = sendSignal
-    this.events = events
-    this.wifiOnly = wifiOnly
-    this.onClose = onClose
-    this.pc = new RTCPeerConnection({ iceServers })
+  constructor(options: LinkOptions) {
+    this.options = options
+    this.events = options.events
+    this.peerId = options.peerId
+    this.polite = options.selfId > options.peerId
+    this.pc = new RTCPeerConnection({ iceServers: options.iceServers })
     // A pre-negotiated channel lets either side start the connection without
     // waiting for the other to announce it.
     this.channel = this.pc.createDataChannel('pexydrop', { negotiated: true, id: 0, ordered: true })
@@ -147,7 +193,7 @@ export class PeerLink {
 
     this.opened = new Promise<void>((resolve, reject) => {
       const timer = window.setTimeout(() => {
-        const error = new Error('Could not reach that device. Make sure both devices are on the same Wi-Fi and the page is open.')
+        const error = new Error('Could not reach that device. Put both devices on the same Wi-Fi, or connect one to the other\'s hotspot, and keep PexyDrop open on both.')
         reject(error)
         this.close(error.message)
       }, connectTimeout)
@@ -168,7 +214,7 @@ export class PeerLink {
   }
 
   private signal(data: Omit<Signal, 'session'>) {
-    this.sendSignal({ session: this.session, ...data })
+    this.options.sendSignal({ session: this.session, ...data })
   }
 
   // "Perfect negotiation": either side may start, and the polite side yields when
@@ -200,8 +246,10 @@ export class PeerLink {
     })
   }
 
+  // Works out whether the chosen path stays on the local network. The connection
+  // type alone can't tell: a phone sharing its hotspot reports "cellular" even
+  // though traffic to the laptop on that hotspot never touches mobile data.
   private async detectRoute(): Promise<Route> {
-    if (onCellular()) return 'internet'
     try {
       const stats = await this.pc.getStats()
       let pair: RTCIceCandidatePairStats | undefined
@@ -213,7 +261,7 @@ export class PeerLink {
           if (report.type === 'candidate-pair' && report.state === 'succeeded' && (report.selected || report.nominated)) pair = report
         })
       }
-      if (!pair) return 'local'
+      if (!pair) return onCellular() ? 'internet' : 'local'
       const local = stats.get(pair.localCandidateId)
       const remote = stats.get(pair.remoteCandidateId)
       if (local?.candidateType === 'relay' || remote?.candidateType === 'relay') return 'internet'
@@ -225,16 +273,12 @@ export class PeerLink {
       stats.forEach((report) => {
         if (report.type === 'local-candidate' && report.candidateType === 'srflx') ownPublicAddresses.add(report.address ?? report.ip)
       })
-      if (!remoteAddress || remoteAddress.endsWith('.local') || isPrivateAddress(remoteAddress) || ownPublicAddresses.has(remoteAddress)) return 'local'
+      if (ownPublicAddresses.has(remoteAddress)) return 'local'
+      if (!remoteAddress || remoteAddress.endsWith('.local') || isPrivateAddress(remoteAddress)) return onCellular() ? 'internet' : 'local'
       return 'internet'
     } catch {
-      return 'local'
+      return onCellular() ? 'internet' : 'local'
     }
-  }
-
-  private async ready() {
-    await this.opened
-    if (this.wifiOnly() && this.route === 'internet') throw new Error(wifiOnlyMessage)
   }
 
   private control(message: Control) {
@@ -265,8 +309,25 @@ export class PeerLink {
     })
   }
 
-  async sendFiles(files: File[]) {
-    if (this.outgoing) throw new Error('Already sending to this device. Wait for it to finish.')
+  // Batches picked while another is still sending wait their turn.
+  sendFiles(files: File[]) {
+    if (!files.length || this.closed) return
+    this.sendQueue.push(files)
+    this.events.queued(this.peerId, this.pumping ? this.sendQueue.length : 0)
+    if (!this.pumping) void this.pump()
+  }
+
+  private async pump() {
+    this.pumping = true
+    while (this.sendQueue.length && !this.closed) {
+      const files = this.sendQueue.shift()!
+      this.events.queued(this.peerId, this.sendQueue.length)
+      await this.runSend(files)
+    }
+    this.pumping = false
+  }
+
+  private async runSend(files: File[]) {
     const meta = files.map((file) => ({ name: file.name, size: file.size, type: file.type }))
     const total = meta.reduce((sum, file) => sum + file.size, 0)
     const transfer: Transfer = { id: makeId(), peerId: this.peerId, direction: 'send', files: meta, total, transferred: 0, speed: 0, status: 'connecting' }
@@ -274,7 +335,10 @@ export class PeerLink {
     this.outgoing = state
     this.events.transfer({ ...transfer })
     try {
-      await this.ready()
+      await this.opened
+      if (this.route === 'internet' && this.options.askBeforeInternet() && !(await this.options.confirmInternet(this.peerId, total))) {
+        state.cancelled = true
+      }
       if (state.cancelled) throw new Error('Cancelled')
       this.update(transfer, { status: 'waiting' })
       const reply = this.awaitReply(state)
@@ -317,23 +381,27 @@ export class PeerLink {
   }
 
   async sendText(text: string) {
-    await this.ready()
+    await this.opened
     this.control({ t: 'text', text })
   }
 
-  respond(offerId: string, accept: boolean) {
+  // With a folder, files stream straight to disk instead of being held in memory.
+  respond(offerId: string, accept: boolean, folder?: FileSystemDirectoryHandle) {
     const offer = this.pendingOffer
     if (!offer || offer.id !== offerId) return
     this.pendingOffer = null
     if (!accept) return this.control({ t: 'decline', id: offerId, reason: 'They declined the files.' })
-    const transfer: Transfer = { id: offer.id, peerId: this.peerId, direction: 'receive', files: offer.files, total: offer.total, transferred: 0, speed: 0, status: 'receiving' }
-    this.incoming = { transfer, index: -1, chunks: [], meter: new Meter() }
+    const transfer: Transfer = { id: offer.id, peerId: this.peerId, direction: 'receive', files: offer.files, total: offer.total, transferred: 0, speed: 0, status: 'receiving', toDisk: Boolean(folder) }
+    this.incoming = { transfer, index: -1, chunks: [], meter: new Meter(), folder, chain: Promise.resolve(), failed: false }
     this.events.transfer({ ...transfer })
     this.control({ t: 'accept', id: offerId })
   }
 
+  // Cancels the batch in progress and anything queued behind it.
   cancel(transferId: string) {
     if (this.outgoing?.transfer.id === transferId) {
+      this.sendQueue = []
+      this.events.queued(this.peerId, 0)
       this.outgoing.cancelled = true
       this.control({ t: 'cancel', id: transferId })
       this.outgoing.resolve?.({ t: 'cancel', id: transferId })
@@ -341,16 +409,35 @@ export class PeerLink {
     }
     if (this.incoming?.transfer.id === transferId) {
       this.control({ t: 'cancel', id: transferId })
-      this.update(this.incoming.transfer, { status: 'cancelled', speed: 0 })
-      this.incoming = null
+      this.abortIncoming('cancelled')
     }
+  }
+
+  private abortIncoming(status: 'cancelled' | 'failed', error?: string) {
+    const incoming = this.incoming
+    if (!incoming) return
+    incoming.failed = true
+    incoming.writer?.abort().catch(() => {})
+    this.update(incoming.transfer, { status, speed: 0, error })
+    this.incoming = null
+  }
+
+  private step(incoming: Incoming, task: () => Promise<void> | void) {
+    incoming.chain = incoming.chain
+      .then(() => (incoming.failed ? undefined : task()))
+      .catch((error: Error) => {
+        if (this.incoming !== incoming) return
+        this.control({ t: 'cancel', id: incoming.transfer.id })
+        this.abortIncoming('failed', `Couldn't save to the folder: ${error.message}`)
+      })
   }
 
   private receive(data: string | ArrayBuffer) {
     if (typeof data !== 'string') {
       const incoming = this.incoming
       if (!incoming || incoming.index < 0) return
-      incoming.chunks.push(data)
+      if (incoming.folder) this.step(incoming, () => incoming.writer?.write(data))
+      else incoming.chunks.push(data)
       incoming.transfer.transferred += data.byteLength
       if (incoming.meter.sample(incoming.transfer.transferred)) this.update(incoming.transfer, { speed: incoming.meter.speed })
       return
@@ -372,7 +459,6 @@ export class PeerLink {
         })) : []
         if (!files.length) return
         if (this.incoming || this.pendingOffer) return this.control({ t: 'decline', id: message.id, reason: 'That device is busy with another transfer.' })
-        if (this.wifiOnly() && this.route === 'internet') return this.control({ t: 'decline', id: message.id, reason: 'That device only accepts files over Wi-Fi.' })
         this.pendingOffer = { id: String(message.id), peerId: this.peerId, files, total: files.reduce((sum, file) => sum + file.size, 0) }
         this.events.offer(this.pendingOffer)
         break
@@ -384,6 +470,8 @@ export class PeerLink {
         break
       case 'cancel':
         if (this.outgoing?.transfer.id === message.id) {
+          this.sendQueue = []
+          this.events.queued(this.peerId, 0)
           this.outgoing.cancelled = true
           this.outgoing.resolve?.(message)
           this.wakeSender?.()
@@ -392,33 +480,53 @@ export class PeerLink {
           this.pendingOffer = null
           this.events.offerWithdrawn(message.id)
         }
-        if (this.incoming?.transfer.id === message.id) {
-          this.update(this.incoming.transfer, { status: 'cancelled', speed: 0 })
-          this.incoming = null
+        if (this.incoming?.transfer.id === message.id) this.abortIncoming('cancelled')
+        break
+      case 'file': {
+        const incoming = this.incoming
+        const meta = incoming?.transfer.files[message.index]
+        if (!incoming || incoming.transfer.id !== message.id || !meta) break
+        incoming.index = message.index
+        incoming.chunks = []
+        const folder = incoming.folder
+        if (folder) {
+          this.step(incoming, async () => {
+            const created = await createUniqueFile(folder, meta.name)
+            incoming.savedAs = created.name
+            incoming.writer = await created.handle.createWritable()
+          })
         }
         break
-      case 'file':
-        if (this.incoming?.transfer.id === message.id) {
-          this.incoming.index = message.index
-          this.incoming.chunks = []
-        }
-        break
+      }
       case 'file-end': {
         const incoming = this.incoming
         const meta = incoming?.transfer.files[message.index]
         if (!incoming || incoming.transfer.id !== message.id || !meta) break
-        this.events.file(new File(incoming.chunks, meta.name, { type: meta.type || 'application/octet-stream' }), this.peerId)
-        incoming.chunks = []
+        if (incoming.folder) {
+          this.step(incoming, async () => {
+            await incoming.writer?.close()
+            incoming.writer = undefined
+            this.events.saved(meta, incoming.savedAs ?? meta.name, this.peerId)
+          })
+        } else {
+          this.events.file(new File(incoming.chunks, meta.name, { type: meta.type || 'application/octet-stream' }), this.peerId)
+          incoming.chunks = []
+        }
         incoming.index = -1
         break
       }
-      case 'done':
-        if (this.incoming?.transfer.id === message.id) {
-          this.update(this.incoming.transfer, { status: 'done', transferred: this.incoming.transfer.total, speed: 0 })
+      case 'done': {
+        const incoming = this.incoming
+        if (!incoming || incoming.transfer.id !== message.id) break
+        // Confirm only once everything has been written, so "Sent" means saved.
+        this.step(incoming, () => {
+          if (this.incoming !== incoming) return
+          this.update(incoming.transfer, { status: 'done', transferred: incoming.transfer.total, speed: 0 })
           this.incoming = null
           this.control({ t: 'received', id: message.id })
-        }
+        })
         break
+      }
       case 'text':
         if (typeof message.text === 'string' && message.text) this.events.text(message.text.slice(0, 100_000), this.peerId)
         break
@@ -430,16 +538,17 @@ export class PeerLink {
     this.closed = true
     const error = new Error(reason)
     this.rejectOpen(error)
+    this.sendQueue = []
+    this.events.queued(this.peerId, 0)
     this.outgoing?.reject?.(error)
     this.wakeSender?.()
-    if (this.incoming) this.update(this.incoming.transfer, { status: 'failed', speed: 0, error: reason })
-    this.incoming = null
+    this.abortIncoming('failed', reason)
     if (this.pendingOffer) this.events.offerWithdrawn(this.pendingOffer.id)
     this.pendingOffer = null
     this.events.route(this.peerId, null)
     this.channel.close()
     this.pc.close()
-    this.onClose()
+    this.options.onClose()
   }
 }
 
@@ -447,25 +556,38 @@ export class PeerManager {
   private readonly links = new Map<string, PeerLink>()
   private readonly sendSignal: (to: string, data: Signal) => void
   private readonly events: LinkEvents
-  private readonly wifiOnly: () => boolean
+  private readonly askBeforeInternet: () => boolean
+  private readonly confirmInternet: ConfirmInternet
+  private iceServers = defaultIceServers
   private selfId = ''
 
-  constructor(sendSignal: (to: string, data: Signal) => void, events: LinkEvents, wifiOnly: () => boolean) {
+  constructor(sendSignal: (to: string, data: Signal) => void, events: LinkEvents, askBeforeInternet: () => boolean, confirmInternet: ConfirmInternet) {
     this.sendSignal = sendSignal
     this.events = events
-    this.wifiOnly = wifiOnly
+    this.askBeforeInternet = askBeforeInternet
+    this.confirmInternet = confirmInternet
   }
 
-  setSelf(id: string) {
+  setSelf(id: string, iceServers?: RTCIceServer[]) {
     if (this.selfId && this.selfId !== id) this.closeAll()
     this.selfId = id
+    if (iceServers?.length) this.iceServers = iceServers
   }
 
   get(peerId: string) {
     const existing = this.links.get(peerId)
     if (existing && !existing.closed) return existing
-    const link: PeerLink = new PeerLink(this.selfId, peerId, (data) => this.sendSignal(peerId, data), this.events, this.wifiOnly, () => {
-      if (this.links.get(peerId) === link) this.links.delete(peerId)
+    const link: PeerLink = new PeerLink({
+      selfId: this.selfId,
+      peerId,
+      iceServers: this.iceServers,
+      sendSignal: (data) => this.sendSignal(peerId, data),
+      events: this.events,
+      askBeforeInternet: this.askBeforeInternet,
+      confirmInternet: this.confirmInternet,
+      onClose: () => {
+        if (this.links.get(peerId) === link) this.links.delete(peerId)
+      },
     })
     this.links.set(peerId, link)
     return link

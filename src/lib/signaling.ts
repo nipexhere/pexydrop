@@ -9,7 +9,7 @@ export type RemotePeer = {
 }
 
 export type ServerMessage =
-  | { type: 'welcome'; id: string }
+  | { type: 'welcome'; id: string; iceServers?: RTCIceServer[] }
   | { type: 'peers'; peers: RemotePeer[] }
   | { type: 'room'; code: string | null }
   | { type: 'room-error'; error: string }

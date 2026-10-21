@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useRef, useState, type DragEvent, type FormEvent } from 'react'
 import {
+  ArrowDownLeft,
   ArrowLeftRight,
+  ArrowUpRight,
   Check,
   Copy,
   Download,
@@ -11,7 +13,9 @@ import {
   FileImage,
   FileText,
   FileVideo,
+  FolderOpen,
   Globe,
+  History,
   Laptop,
   Link2,
   LogOut,
@@ -24,6 +28,7 @@ import {
   Smartphone,
   Tablet,
   Trash2,
+  TriangleAlert,
   Upload,
   Wifi,
   X,
@@ -32,19 +37,24 @@ import { QRCodeSVG } from 'qrcode.react'
 import { describeDevice, detectDevice, loadDeviceName, saveDeviceName, type DeviceKind } from './lib/identity'
 import { makeId, onCellular, PeerManager, type IncomingOffer, type Route, type Transfer } from './lib/peer'
 import { Signaling, type RemotePeer } from './lib/signaling'
+import { canSaveToFolder, folderReady, forgetSaveFolder, loadHistory, loadSaveFolder, pickSaveFolder, saveHistory, type HistoryEntry } from './lib/storage'
 
 type Received =
   | { id: string; kind: 'file'; file: File; url: string; from: string; at: number }
+  | { id: string; kind: 'saved'; name: string; size: number; folder: string; from: string; at: number }
   | { id: string; kind: 'text'; text: string; from: string; at: number }
 
 type Staged = { files: File[]; text: string }
+type DataPrompt = { peerId: string; bytes: number; resolve: (send: boolean) => void }
 
 const roomStorage = 'pexydrop-room'
 const secretStorage = 'pexydrop-secret'
-const wifiOnlyStorage = 'pexydrop-wifi-only'
+const askDataStorage = 'pexydrop-wifi-only'
+const autoSaveStorage = 'pexydrop-auto-save'
 const shareCache = 'pexydrop-share'
 const terminal = new Set(['done', 'declined', 'cancelled', 'failed'])
 const thisDevice = detectDevice()
+const isComputer = thisDevice === 'laptop' || thisDevice === 'desktop'
 
 function storageGet(storage: () => Storage, key: string) {
   try {
@@ -93,6 +103,15 @@ function formatBytes(bytes: number) {
   return `${size.toFixed(size >= 100 ? 0 : 1)} ${units[unit]}`
 }
 
+function formatWhen(at: number) {
+  const minutes = Math.round((Date.now() - at) / 60_000)
+  if (minutes < 1) return 'just now'
+  if (minutes < 60) return `${minutes} min ago`
+  const date = new Date(at)
+  const sameDay = date.toDateString() === new Date().toDateString()
+  return sameDay ? date.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) : date.toLocaleDateString([], { month: 'short', day: 'numeric' })
+}
+
 function fileIcon(type: string) {
   if (type.startsWith('image/')) return FileImage
   if (type.startsWith('video/')) return FileVideo
@@ -118,6 +137,13 @@ function isLink(text: string) {
 
 function plural(count: number, word: string) {
   return `${count} ${word}${count === 1 ? '' : 's'}`
+}
+
+function download(url: string, name: string) {
+  const link = document.createElement('a')
+  link.href = url
+  link.download = name
+  link.click()
 }
 
 function describeTransfer(transfer: Transfer) {
@@ -164,17 +190,40 @@ function ProgressRing({ value }: { value: number }) {
   )
 }
 
+function Toggle({ title, description, checked, onChange }: { title: string; description: string; checked: boolean; onChange: () => void }) {
+  return (
+    <label className="toggle-row">
+      <span>
+        <strong>{title}</strong>
+        <small>{description}</small>
+      </span>
+      <input type="checkbox" checked={checked} onChange={onChange} />
+      <span className="toggle" aria-hidden="true" />
+    </label>
+  )
+}
+
 export default function App() {
   const [name, setName] = useState(loadDeviceName)
   const [nameDraft, setNameDraft] = useState(name)
   const [editingName, setEditingName] = useState(false)
-  const [wifiOnly, setWifiOnly] = useState(() => storageGet(() => localStorage, wifiOnlyStorage) !== 'false')
+  const [askBeforeData, setAskBeforeData] = useState(() => storageGet(() => localStorage, askDataStorage) !== 'false')
+  const [autoSave, setAutoSave] = useState(() => {
+    const saved = storageGet(() => localStorage, autoSaveStorage)
+    return saved === null ? isComputer : saved === 'true'
+  })
+  const [folder, setFolder] = useState<FileSystemDirectoryHandle | null>(null)
   const [online, setOnline] = useState(false)
   const [peers, setPeers] = useState<RemotePeer[]>([])
   const [routes, setRoutes] = useState<Record<string, Route>>({})
   const [transfers, setTransfers] = useState<Record<string, Transfer>>({})
+  const [queued, setQueued] = useState<Record<string, number>>({})
   const [offers, setOffers] = useState<IncomingOffer[]>([])
+  const [trustOffer, setTrustOffer] = useState(false)
+  const [trusted, setTrusted] = useState<string[]>([])
+  const [dataPrompt, setDataPrompt] = useState<DataPrompt | null>(null)
   const [received, setReceived] = useState<Received[]>([])
+  const [recent, setRecent] = useState<HistoryEntry[]>(loadHistory)
   const [shownText, setShownText] = useState<Extract<Received, { kind: 'text' }> | null>(null)
   const [room, setRoom] = useState<string | null>(null)
   const [roomInput, setRoomInput] = useState('')
@@ -187,10 +236,14 @@ export default function App() {
   const [pageDrag, setPageDrag] = useState(false)
   const [toast, setToast] = useState('')
   const [cellular, setCellular] = useState(onCellular)
+  const [cellularDismissed, setCellularDismissed] = useState(false)
   const [copiedId, setCopiedId] = useState('')
 
   const nameRef = useRef(name)
-  const wifiOnlyRef = useRef(wifiOnly)
+  const askBeforeDataRef = useRef(askBeforeData)
+  const autoSaveRef = useRef(autoSave)
+  const folderRef = useRef(folder)
+  const trustedRef = useRef(trusted)
   const peersRef = useRef<RemotePeer[]>([])
   const joinSourceRef = useRef<'url' | 'saved' | 'manual' | null>(null)
   const signalingRef = useRef<Signaling | null>(null)
@@ -198,47 +251,82 @@ export default function App() {
   const pickTargetRef = useRef<string | null>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
   nameRef.current = name
-  wifiOnlyRef.current = wifiOnly
+  askBeforeDataRef.current = askBeforeData
+  autoSaveRef.current = autoSave
+  folderRef.current = folder
+  trustedRef.current = trusted
 
   useEffect(() => {
     const peerName = (peerId: string) => peersRef.current.find((peer) => peer.id === peerId)?.name ?? 'A nearby device'
 
-    const manager = new PeerManager((to, data) => signalingRef.current?.send({ type: 'signal', to, data }), {
-      transfer: (transfer) => {
-        setTransfers((current) => ({ ...current, [transfer.peerId]: transfer }))
-        if (transfer.status === 'failed' && transfer.error) setToast(transfer.error)
-        if (transfer.status === 'declined') setToast(transfer.error || 'They declined the files.')
-        if (terminal.has(transfer.status)) {
-          window.setTimeout(() => setTransfers((current) => {
-            const latest = current[transfer.peerId]
-            if (latest?.id !== transfer.id || latest.status !== transfer.status) return current
-            const next = { ...current }
-            delete next[transfer.peerId]
-            return next
-          }), 6000)
-        }
+    const manager = new PeerManager(
+      (to, data) => signalingRef.current?.send({ type: 'signal', to, data }),
+      {
+        transfer: (transfer) => {
+          setTransfers((current) => ({ ...current, [transfer.peerId]: transfer }))
+          if (transfer.status === 'failed' && transfer.error) setToast(transfer.error)
+          if (transfer.status === 'declined') setToast(transfer.error || 'They declined the files.')
+          if (transfer.status === 'done') {
+            const entry: HistoryEntry = {
+              id: transfer.id,
+              direction: transfer.direction,
+              peer: peerName(transfer.peerId),
+              names: transfer.files.slice(0, 3).map((file) => file.name),
+              count: transfer.files.length,
+              total: transfer.total,
+              at: Date.now(),
+            }
+            setRecent((current) => saveHistory([entry, ...current.filter((item) => item.id !== entry.id)]))
+          }
+          if (terminal.has(transfer.status)) {
+            window.setTimeout(() => setTransfers((current) => {
+              const latest = current[transfer.peerId]
+              if (latest?.id !== transfer.id || latest.status !== transfer.status) return current
+              const next = { ...current }
+              delete next[transfer.peerId]
+              return next
+            }), 6000)
+          }
+        },
+        queued: (peerId, count) => setQueued((current) => ({ ...current, [peerId]: count })),
+        offer: (offer) => {
+          if (trustedRef.current.includes(offer.peerId)) {
+            void (async () => {
+              const saveFolder = folderRef.current
+              const useFolder = saveFolder && (await folderReady(saveFolder, false))
+              manager.get(offer.peerId).respond(offer.id, true, useFolder ? saveFolder : undefined)
+            })()
+            return
+          }
+          setOffers((current) => [...current, offer])
+          navigator.vibrate?.(120)
+        },
+        offerWithdrawn: (offerId) => setOffers((current) => current.filter((offer) => offer.id !== offerId)),
+        file: (file, peerId) => {
+          const url = URL.createObjectURL(file)
+          setReceived((current) => [{ id: makeId(), kind: 'file', file, url, from: peerName(peerId), at: Date.now() }, ...current])
+          if (autoSaveRef.current) download(url, file.name)
+        },
+        saved: (meta, savedAs, peerId) => {
+          const folderName = folderRef.current?.name || 'your folder'
+          setReceived((current) => [{ id: makeId(), kind: 'saved', name: savedAs, size: meta.size, folder: folderName, from: peerName(peerId), at: Date.now() }, ...current])
+        },
+        text: (text, peerId) => {
+          const item = { id: makeId(), kind: 'text' as const, text, from: peerName(peerId), at: Date.now() }
+          setReceived((current) => [item, ...current])
+          setShownText(item)
+          navigator.vibrate?.(80)
+        },
+        route: (peerId, route) => setRoutes((current) => {
+          const next = { ...current }
+          if (route) next[peerId] = route
+          else delete next[peerId]
+          return next
+        }),
       },
-      offer: (offer) => {
-        setOffers((current) => [...current, offer])
-        navigator.vibrate?.(120)
-      },
-      offerWithdrawn: (offerId) => setOffers((current) => current.filter((offer) => offer.id !== offerId)),
-      file: (file, peerId) => {
-        setReceived((current) => [{ id: makeId(), kind: 'file', file, url: URL.createObjectURL(file), from: peerName(peerId), at: Date.now() }, ...current])
-      },
-      text: (text, peerId) => {
-        const item = { id: makeId(), kind: 'text' as const, text, from: peerName(peerId), at: Date.now() }
-        setReceived((current) => [item, ...current])
-        setShownText(item)
-        navigator.vibrate?.(80)
-      },
-      route: (peerId, route) => setRoutes((current) => {
-        const next = { ...current }
-        if (route) next[peerId] = route
-        else delete next[peerId]
-        return next
-      }),
-    }, () => wifiOnlyRef.current)
+      () => askBeforeDataRef.current,
+      (peerId, bytes) => new Promise<boolean>((resolve) => setDataPrompt({ peerId, bytes, resolve })),
+    )
     managerRef.current = manager
 
     const signaling = new Signaling(
@@ -246,7 +334,7 @@ export default function App() {
       (message) => {
         switch (message.type) {
           case 'welcome': {
-            manager.setSelf(message.id)
+            manager.setSelf(message.id, message.iceServers)
             const fromUrl = takeUrlParam('room')
             const saved = storageGet(() => sessionStorage, roomStorage)
             if (fromUrl) {
@@ -299,6 +387,7 @@ export default function App() {
 
   useEffect(() => {
     fetch('/api/info').then((response) => response.json()).then((info: { addresses: string[] }) => setAddresses(info.addresses)).catch(() => {})
+    void loadSaveFolder().then(setFolder)
   }, [])
 
   // Files shared into the installed app from another app's share sheet (Android).
@@ -367,10 +456,11 @@ export default function App() {
 
   const offer = offers[0]
   const offerFrom = offer ? peers.find((peer) => peer.id === offer.peerId) : undefined
+  const promptPeer = dataPrompt ? peers.find((peer) => peer.id === dataPrompt.peerId) : undefined
+  const showCellularNotice = cellular && !cellularDismissed && !Object.values(routes).includes('local')
 
   function sendFiles(peerId: string, files: File[]) {
-    if (!files.length) return
-    managerRef.current?.get(peerId).sendFiles(files).catch((error: Error) => setToast(error.message))
+    if (files.length) managerRef.current?.get(peerId).sendFiles(files)
   }
 
   function sendText(peerId: string, text: string) {
@@ -378,8 +468,6 @@ export default function App() {
   }
 
   function chooseFor(peer: RemotePeer) {
-    const active = transfers[peer.id]
-    if (active && !terminal.has(active.status)) return
     if (staged?.files.length) {
       sendFiles(peer.id, staged.files)
       setStaged(null)
@@ -403,10 +491,21 @@ export default function App() {
     else setStaged({ files, text: '' })
   }
 
-  function respond(accept: boolean) {
+  async function respond(accept: boolean) {
     if (!offer) return
-    managerRef.current?.get(offer.peerId).respond(offer.id, accept)
     setOffers((current) => current.filter((item) => item.id !== offer.id))
+    const link = managerRef.current?.get(offer.peerId)
+    if (!accept) return link?.respond(offer.id, false)
+    if (trustOffer) setTrusted((current) => [...new Set([...current, offer.peerId])])
+    setTrustOffer(false)
+    // Pressing Accept counts as the click browsers need before granting folder access.
+    const useFolder = folder && (await folderReady(folder, true))
+    link?.respond(offer.id, true, useFolder ? folder : undefined)
+  }
+
+  function answerDataPrompt(send: boolean) {
+    dataPrompt?.resolve(send)
+    setDataPrompt(null)
   }
 
   function saveName(event: FormEvent) {
@@ -422,10 +521,29 @@ export default function App() {
     setEditingName(false)
   }
 
-  function toggleWifiOnly() {
-    const next = !wifiOnly
-    setWifiOnly(next)
-    storageSet(() => localStorage, wifiOnlyStorage, String(next))
+  function toggleAskBeforeData() {
+    const next = !askBeforeData
+    setAskBeforeData(next)
+    storageSet(() => localStorage, askDataStorage, String(next))
+  }
+
+  function toggleAutoSave() {
+    const next = !autoSave
+    setAutoSave(next)
+    storageSet(() => localStorage, autoSaveStorage, String(next))
+  }
+
+  async function chooseFolder() {
+    try {
+      setFolder(await pickSaveFolder())
+    } catch (error) {
+      if ((error as Error).name !== 'AbortError') setToast('That folder could not be used.')
+    }
+  }
+
+  function useDownloads() {
+    setFolder(null)
+    void forgetSaveFolder()
   }
 
   function joinRoom(event: FormEvent) {
@@ -454,14 +572,8 @@ export default function App() {
   }
 
   function saveAll() {
-    received.forEach((item, index) => {
-      if (item.kind !== 'file') return
-      window.setTimeout(() => {
-        const link = document.createElement('a')
-        link.href = item.url
-        link.download = item.file.name
-        link.click()
-      }, index * 300)
+    received.filter((item) => item.kind === 'file').forEach((item, index) => {
+      window.setTimeout(() => download(item.url, item.file.name), index * 300)
     })
   }
 
@@ -470,10 +582,14 @@ export default function App() {
     setReceived([])
   }
 
+  function clearHistory() {
+    setRecent(saveHistory([]))
+  }
+
   const receivedFiles = received.filter((item) => item.kind === 'file')
   const canShareFiles = typeof navigator.canShare === 'function'
   const SelfIcon = deviceIcon(thisDevice)
-  const hint = thisDevice === 'phone' || thisDevice === 'tablet' ? 'Tap to send' : 'Click or drop files'
+  const hint = isComputer ? 'Click or drop files' : 'Tap to send'
 
   return (
     <main
@@ -506,10 +622,11 @@ export default function App() {
         </span>
       </header>
 
-      {cellular && (
+      {showCellularNotice && (
         <div className="notice is-warning" role="alert">
           <SignalIcon size={17} />
-          <span><strong>You're on mobile data.</strong> Connect to the same Wi-Fi as your other device so transfers are fast and don't use your data plan.</span>
+          <span><strong>You're on mobile data.</strong> For free, fast transfers, join the same Wi-Fi as your other device, or turn on your hotspot and connect the other device to it.</span>
+          <button className="icon-button" onClick={() => setCellularDismissed(true)} aria-label="Dismiss"><X size={16} /></button>
         </div>
       )}
 
@@ -518,7 +635,7 @@ export default function App() {
           <section className="intro">
             <p className="eyebrow"><span /> DEVICE TO DEVICE · OVER YOUR WI-FI</p>
             <h1>Tap a device.<br /><span>Send anything.</span></h1>
-            <p className="intro-copy">Open PexyDrop on any phone or computer on the same Wi-Fi and it appears below. Files go straight across, encrypted, and are never uploaded to a server.</p>
+            <p className="intro-copy">Open PexyDrop on any phone or computer on the same Wi-Fi or hotspot and it appears below. Files go straight across, encrypted, and are never uploaded to a server.</p>
           </section>
 
           {staged && (
@@ -545,6 +662,8 @@ export default function App() {
                 const active = transfer && !terminal.has(transfer.status)
                 const progress = transfer && transfer.total ? transfer.transferred / transfer.total : 0
                 const route = routes[peer.id]
+                const waiting = queued[peer.id] ?? 0
+                const isTrusted = trusted.includes(peer.id)
                 return (
                   <article
                     key={peer.id}
@@ -559,7 +678,7 @@ export default function App() {
                       sendFiles(peer.id, Array.from(event.dataTransfer.files))
                     }}
                   >
-                    <button className="device-main" onClick={() => chooseFor(peer)} disabled={active} aria-label={`Send files to ${peer.name}`}>
+                    <button className="device-main" onClick={() => chooseFor(peer)} aria-label={active ? `Queue more files for ${peer.name}` : `Send files to ${peer.name}`}>
                       <span className="device-avatar">
                         {active && (transfer.status === 'sending' || transfer.status === 'receiving') && <ProgressRing value={progress} />}
                         {active && (transfer.status === 'connecting' || transfer.status === 'waiting') && <span className="pulse-ring" />}
@@ -568,14 +687,22 @@ export default function App() {
                       <span className="device-name" title={peer.name}>{peer.name}</span>
                       <span className="device-detail">{peer.detail || 'Web browser'}</span>
                       <span className={`device-status status-${transfer?.status ?? 'idle'}`}>{transfer ? describeTransfer(transfer) : hint}</span>
+                      {waiting > 0 && <span className="queue-chip">+{waiting} queued</span>}
                     </button>
                     <div className="device-foot">
                       <span className={`route-badge ${route === 'internet' ? 'is-internet' : ''}`}>
-                        {route === 'internet' ? <><Globe size={12} /> Internet</> : route === 'local' ? <><Wifi size={12} /> Wi-Fi direct</> : peer.via === 'code' ? <><Link2 size={12} /> Paired</> : <><Wifi size={12} /> Same network</>}
+                        {route === 'internet' ? <><Globe size={12} /> Internet</> : route === 'local' ? <><Wifi size={12} /> Local</> : peer.via === 'code' ? <><Link2 size={12} /> Paired</> : <><Wifi size={12} /> Nearby</>}
                       </span>
-                      {active
-                        ? <button className="mini-button" onClick={() => managerRef.current?.get(peer.id).cancel(transfer.id)}>Cancel</button>
-                        : <button className="mini-button" onClick={() => { setComposeFor(peer); setDraft('') }} aria-label={`Send text to ${peer.name}`}><MessageSquareText size={14} /> Text</button>}
+                      <span className="foot-actions">
+                        {isTrusted && (
+                          <button className="trust-chip" onClick={() => setTrusted((current) => current.filter((id) => id !== peer.id))} title="Stop auto-accepting from this device">
+                            <ShieldCheck size={12} /> Auto
+                          </button>
+                        )}
+                        {active
+                          ? <button className="mini-button" onClick={() => managerRef.current?.get(peer.id).cancel(transfer.id)}>Cancel</button>
+                          : <button className="mini-button" onClick={() => { setComposeFor(peer); setDraft('') }} aria-label={`Send text to ${peer.name}`}><MessageSquareText size={14} /> Text</button>}
+                      </span>
                     </div>
                   </article>
                 )
@@ -585,7 +712,11 @@ export default function App() {
             <div className="empty-radar">
               <div className="radar" aria-hidden="true"><span /><span /><span /><SelfIcon size={24} /></div>
               <p>{online ? 'Looking for devices…' : 'Connecting to PexyDrop…'}</p>
-              <span>Open <strong>{siteAddress}</strong> on your other device while it's on this Wi-Fi, or pair with the code{thisDevice === 'phone' ? ' below' : ''}.</span>
+              <span>Open <strong>{siteAddress}</strong> on your other device while it's on this Wi-Fi, or pair with the code{isComputer ? '' : ' below'}.</span>
+              <div className="hotspot-tip">
+                <Wifi size={16} />
+                <span><strong>No shared Wi-Fi?</strong> Turn on your phone's hotspot and connect the laptop to it. Transfers between the two stay free and don't use your data plan.</span>
+              </div>
             </div>
           )}
 
@@ -611,6 +742,15 @@ export default function App() {
                       </article>
                     )
                   }
+                  if (item.kind === 'saved') {
+                    return (
+                      <article className="received-row" key={item.id}>
+                        <span className="file-icon"><FolderOpen size={18} /></span>
+                        <div className="file-meta"><p title={item.name}>{item.name}</p><span>{formatBytes(item.size)} · from {item.from}</span></div>
+                        <span className="saved-tag"><Check size={14} /> In {item.folder}</span>
+                      </article>
+                    )
+                  }
                   const Icon = fileIcon(item.file.type)
                   return (
                     <article className="received-row" key={item.id}>
@@ -627,6 +767,30 @@ export default function App() {
                 })}
               </div>
             </section>
+          )}
+
+          {recent.length > 0 && (
+            <details className="history">
+              <summary>
+                <History size={16} />
+                <span>History</span>
+                <span className="count">{recent.length}</span>
+              </summary>
+              <div className="history-list">
+                {recent.map((entry) => (
+                  <div className="history-row" key={entry.id}>
+                    <span className={`history-icon ${entry.direction === 'send' ? 'is-sent' : ''}`}>
+                      {entry.direction === 'send' ? <ArrowUpRight size={15} /> : <ArrowDownLeft size={15} />}
+                    </span>
+                    <div className="file-meta">
+                      <p title={entry.names.join(', ')}>{entry.count === 1 ? entry.names[0] : `${entry.names.join(', ')}${entry.count > entry.names.length ? ` + ${entry.count - entry.names.length} more` : ''}`}</p>
+                      <span>{entry.direction === 'send' ? 'Sent to' : 'Received from'} {entry.peer} · {formatBytes(entry.total)} · {formatWhen(entry.at)}</span>
+                    </div>
+                  </div>
+                ))}
+                <button className="text-button" onClick={clearHistory}><Trash2 size={13} /> Clear history</button>
+              </div>
+            </details>
           )}
         </div>
 
@@ -647,7 +811,7 @@ export default function App() {
 
           <section className="panel pair-panel">
             <div className="panel-topline"><Link2 size={15} /><span>PAIR WITH A CODE</span></div>
-            <p className="panel-copy">Not seeing your device? Different Wi-Fi bands or a VPN can hide it. Scan this QR code or enter the code on the other device.</p>
+            <p className="panel-copy">Not seeing your device? Hotspots, different Wi-Fi bands or a VPN can hide it. Scan this QR code or enter the code on the other device.</p>
             {room ? (
               <>
                 <div className="qr-frame">
@@ -679,15 +843,33 @@ export default function App() {
           </section>
 
           <section className="panel settings">
-            <label className="toggle-row">
-              <span>
-                <strong>Wi-Fi only</strong>
-                <small>Refuse transfers that would travel over the internet or mobile data.</small>
-              </span>
-              <input type="checkbox" checked={wifiOnly} onChange={toggleWifiOnly} />
-              <span className="toggle" aria-hidden="true" />
-            </label>
-            <p className="privacy-note"><ShieldCheck size={15} /> Files are encrypted in transit and go directly between devices. You approve every incoming transfer.</p>
+            <Toggle
+              title="Ask before using data"
+              description="Same Wi-Fi or hotspot is always free. You'll be asked before a transfer goes over the internet."
+              checked={askBeforeData}
+              onChange={toggleAskBeforeData}
+            />
+            {canSaveToFolder && isComputer && (
+              <div className="folder-row">
+                <span>
+                  <strong>Save to</strong>
+                  <small>{folder ? <>Files go straight into <b>{folder.name || 'your folder'}</b>, even very large ones.</> : 'Browser downloads. Pick a folder to save large files straight to disk.'}</small>
+                </span>
+                <span className="folder-actions">
+                  <button className="mini-button" onClick={() => void chooseFolder()}><FolderOpen size={14} /> {folder ? 'Change' : 'Choose'}</button>
+                  {folder && <button className="icon-button row-action" onClick={useDownloads} aria-label="Use browser downloads instead" title="Use browser downloads"><X size={15} /></button>}
+                </span>
+              </div>
+            )}
+            {!folder && (
+              <Toggle
+                title="Save files automatically"
+                description="Download each file as soon as it arrives, without pressing Save."
+                checked={autoSave}
+                onChange={toggleAutoSave}
+              />
+            )}
+            <p className="privacy-note"><ShieldCheck size={15} /> Files are encrypted end to end and go directly between devices. You approve every incoming transfer.</p>
           </section>
         </aside>
       </section>
@@ -700,13 +882,31 @@ export default function App() {
         </div>
       )}
 
-      {offer && (
+      {dataPrompt && (
+        <div className="backdrop">
+          <section className="dialog" role="alertdialog" aria-modal="true" aria-labelledby="data-title">
+            <span className="dialog-mark is-warning"><SignalIcon size={20} /></span>
+            <h2 id="data-title">Send over the internet?</h2>
+            <p className="dialog-copy">{promptPeer?.name ?? 'That device'} isn't on your Wi-Fi or hotspot, so this {formatBytes(dataPrompt.bytes)} transfer would go over the internet and may use mobile data.</p>
+            <p className="dialog-tip"><Wifi size={14} /> To send for free, join the same Wi-Fi, or connect one device to the other's hotspot.</p>
+            <div className="dialog-actions">
+              <button className="secondary-button" onClick={() => answerDataPrompt(false)}>Don't send</button>
+              <button className="primary-button" onClick={() => answerDataPrompt(true)} autoFocus>Send anyway</button>
+            </div>
+          </section>
+        </div>
+      )}
+
+      {!dataPrompt && offer && (
         <div className="backdrop">
           <section className="dialog" role="dialog" aria-modal="true" aria-labelledby="offer-title">
             <span className="dialog-mark"><Download size={20} /></span>
             <p className="eyebrow"><span /> INCOMING</p>
             <h2 id="offer-title">{offerFrom?.name ?? 'A nearby device'} wants to send you {plural(offer.files.length, 'file')}</h2>
-            <p className="dialog-copy">{formatBytes(offer.total)} total{routes[offer.peerId] === 'internet' ? ' · over the internet' : ' · over your Wi-Fi'}</p>
+            <p className="dialog-copy">{formatBytes(offer.total)} total{routes[offer.peerId] === 'internet' ? '' : ' · over your local network'}{folder ? ` · saves to ${folder.name || 'your folder'}` : ''}</p>
+            {routes[offer.peerId] === 'internet' && (
+              <p className="dialog-warning"><TriangleAlert size={15} /> Not on your Wi-Fi. This may use about {formatBytes(offer.total)} of mobile data.</p>
+            )}
             <ul className="offer-files">
               {offer.files.slice(0, 4).map((file, index) => {
                 const Icon = fileIcon(file.type)
@@ -714,15 +914,19 @@ export default function App() {
               })}
               {offer.files.length > 4 && <li className="more">+ {plural(offer.files.length - 4, 'more file')}</li>}
             </ul>
+            <label className="check-row">
+              <input type="checkbox" checked={trustOffer} onChange={(event) => setTrustOffer(event.target.checked)} />
+              <span>Accept future files from {offerFrom?.name ?? 'this device'} automatically while this page is open</span>
+            </label>
             <div className="dialog-actions">
-              <button className="secondary-button" onClick={() => respond(false)}>Decline</button>
-              <button className="primary-button" onClick={() => respond(true)} autoFocus><Check size={16} /> Accept</button>
+              <button className="secondary-button" onClick={() => void respond(false)}>Decline</button>
+              <button className="primary-button" onClick={() => void respond(true)} autoFocus><Check size={16} /> Accept</button>
             </div>
           </section>
         </div>
       )}
 
-      {!offer && shownText && (
+      {!dataPrompt && !offer && shownText && (
         <div className="backdrop" onClick={(event) => { if (event.target === event.currentTarget) setShownText(null) }}>
           <section className="dialog" role="dialog" aria-modal="true" aria-labelledby="text-title">
             <span className="dialog-mark"><MessageSquareText size={20} /></span>
