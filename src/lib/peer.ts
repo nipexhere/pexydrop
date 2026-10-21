@@ -1,5 +1,7 @@
 export type FileMeta = { name: string; size: number; type: string }
-export type Route = 'local' | 'internet'
+// local: direct over the same network. internet: direct, but across networks.
+// relay: through the PexyDrop server, because no direct path could be made.
+export type Route = 'local' | 'internet' | 'relay'
 export type TransferStatus = 'connecting' | 'waiting' | 'sending' | 'receiving' | 'done' | 'declined' | 'cancelled' | 'failed'
 
 export type Transfer = {
@@ -28,9 +30,15 @@ export type LinkEvents = {
   route: (peerId: string, route: Route | null) => void
 }
 
-// Asks the person whether a transfer may go over the internet (and so possibly
-// mobile data). Resolves true to go ahead.
-export type ConfirmInternet = (peerId: string, bytes: number) => Promise<boolean>
+// Asks the person whether a transfer may use a route other than the local
+// network (which could mean mobile data). Resolves true to go ahead.
+export type ConfirmRoute = (peerId: string, route: Route, bytes: number) => Promise<boolean>
+
+// Sends relay frames through the signaling server's WebSocket.
+export type RelayTransport = {
+  send: (to: string, payload: Uint8Array) => boolean
+  bufferedAmount: () => number
+}
 
 type Control =
   | { t: 'offer'; id: string; files: FileMeta[]; total: number }
@@ -43,7 +51,12 @@ type Control =
   | { t: 'received'; id: string }
   | { t: 'text'; text: string }
 
-type Signal = { session: string; description?: RTCSessionDescriptionInit; candidate?: RTCIceCandidateInit }
+type Signal = {
+  session: string
+  description?: RTCSessionDescriptionInit
+  candidate?: RTCIceCandidateInit
+  relayKey?: string
+}
 
 type Outgoing = {
   transfer: Transfer
@@ -72,8 +85,14 @@ const readSize = 1024 * 1024
 // Chrome closes a data channel whose send queue passes 16 MiB, so stay well below.
 const highWater = 8 * 1024 * 1024
 const lowWater = 1024 * 1024
-const connectTimeout = 20_000
+// On a local network a direct connection forms within a couple of seconds. If it
+// hasn't by then, the network is probably blocking it, so fall back to the relay.
+const directTimeout = 8000
+const relayTimeout = 10_000
 const defaultIceServers: RTCIceServer[] = [{ urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] }]
+const notResponding = "That device isn't responding. Make sure PexyDrop is open on it and its screen is on."
+const encoder = new TextEncoder()
+const decoder = new TextDecoder()
 
 export function makeId() {
   return Array.from(crypto.getRandomValues(new Uint8Array(8)), (byte) => byte.toString(16).padStart(2, '0')).join('')
@@ -109,6 +128,164 @@ async function createUniqueFile(folder: FileSystemDirectoryHandle, name: string)
   throw new Error('Too many files with that name in the folder.')
 }
 
+// Relay encryption: the two devices agree on an AES-GCM key with ECDH, so the
+// server only forwards ciphertext. Plain-HTTP local hosting has no Web Crypto;
+// there the relay is the laptop itself and data is sent as-is.
+type RelayKeys = { pair: CryptoKeyPair | null; publicKey: string }
+
+async function createRelayKeys(): Promise<RelayKeys> {
+  if (!crypto.subtle) return { pair: null, publicKey: 'plain' }
+  const pair = await crypto.subtle.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, false, ['deriveKey'])
+  const raw = new Uint8Array(await crypto.subtle.exportKey('raw', pair.publicKey))
+  return { pair, publicKey: btoa(String.fromCharCode(...raw)) }
+}
+
+async function deriveRelayKey(keys: RelayKeys, remote: string) {
+  if (!keys.pair || remote === 'plain') {
+    if (keys.pair || remote !== 'plain') throw new Error('The devices could not agree on encryption.')
+    return null
+  }
+  const raw = Uint8Array.from(atob(remote), (character) => character.charCodeAt(0))
+  const publicKey = await crypto.subtle.importKey('raw', raw, { name: 'ECDH', namedCurve: 'P-256' }, false, [])
+  return crypto.subtle.deriveKey({ name: 'ECDH', public: publicKey }, keys.pair.privateKey, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt'])
+}
+
+// Frame layout: [kind: 0 text, 1 binary][12-byte IV][AES-GCM ciphertext].
+async function seal(key: CryptoKey | null, kind: number, bytes: Uint8Array<ArrayBuffer>) {
+  if (!key) {
+    const frame = new Uint8Array(1 + bytes.length)
+    frame[0] = kind
+    frame.set(bytes, 1)
+    return frame
+  }
+  const iv = crypto.getRandomValues(new Uint8Array(12))
+  const cipher = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, bytes))
+  const frame = new Uint8Array(13 + cipher.length)
+  frame[0] = kind
+  frame.set(iv, 1)
+  frame.set(cipher, 13)
+  return frame
+}
+
+async function unseal(key: CryptoKey | null, frame: Uint8Array) {
+  const kind = frame[0]
+  if (!key) return { kind, data: frame.slice(1).buffer }
+  const data = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: frame.slice(1, 13) }, key, frame.slice(13))
+  return { kind, data }
+}
+
+function delay(ms: number) {
+  return new Promise((resolve) => window.setTimeout(resolve, ms))
+}
+
+// The transfer protocol runs over a pipe, which is either the direct WebRTC
+// data channel or the relay through the server.
+interface Pipe {
+  readonly open: boolean
+  readonly bufferedAmount: number
+  send(data: string | ArrayBuffer): void
+  drained(): Promise<void>
+  close(): void
+}
+
+class ChannelPipe implements Pipe {
+  private readonly channel: RTCDataChannel
+
+  constructor(channel: RTCDataChannel) {
+    this.channel = channel
+  }
+
+  get open() {
+    return this.channel.readyState === 'open'
+  }
+
+  get bufferedAmount() {
+    return this.channel.bufferedAmount
+  }
+
+  send(data: string | ArrayBuffer) {
+    if (typeof data === 'string') this.channel.send(data)
+    else this.channel.send(data)
+  }
+
+  drained() {
+    return new Promise<void>((resolve) => {
+      if (!this.open || this.channel.bufferedAmount <= lowWater) return resolve()
+      const done = () => {
+        this.channel.removeEventListener('bufferedamountlow', done)
+        this.channel.removeEventListener('close', done)
+        resolve()
+      }
+      this.channel.addEventListener('bufferedamountlow', done)
+      this.channel.addEventListener('close', done)
+    })
+  }
+
+  close() {
+    this.channel.close()
+  }
+}
+
+class RelayPipe implements Pipe {
+  open = true
+  private pending = 0
+  private sendChain = Promise.resolve()
+  private receiveChain = Promise.resolve()
+  private readonly peerId: string
+  private readonly transport: RelayTransport
+  private readonly key: CryptoKey | null
+  private readonly onData: (data: string | ArrayBuffer) => void
+  private readonly onFail: (reason: string) => void
+
+  constructor(peerId: string, transport: RelayTransport, key: CryptoKey | null, onData: (data: string | ArrayBuffer) => void, onFail: (reason: string) => void) {
+    this.peerId = peerId
+    this.transport = transport
+    this.key = key
+    this.onData = onData
+    this.onFail = onFail
+  }
+
+  get bufferedAmount() {
+    return this.pending + this.transport.bufferedAmount()
+  }
+
+  send(data: string | ArrayBuffer) {
+    if (!this.open) return
+    const kind = typeof data === 'string' ? 0 : 1
+    const bytes = typeof data === 'string' ? encoder.encode(data) : new Uint8Array(data)
+    this.pending += bytes.byteLength
+    // Encryption is asynchronous; chaining keeps frames in the order they were sent.
+    this.sendChain = this.sendChain.then(async () => {
+      if (!this.open) return
+      const frame = await seal(this.key, kind, bytes)
+      this.pending -= bytes.byteLength
+      if (!this.transport.send(this.peerId, frame)) this.fail('Lost the connection to the PexyDrop server.')
+    }).catch(() => this.fail('Could not encrypt the data.'))
+  }
+
+  receive(frame: Uint8Array) {
+    this.receiveChain = this.receiveChain.then(async () => {
+      if (!this.open) return
+      const { kind, data } = await unseal(this.key, frame)
+      this.onData(kind === 0 ? decoder.decode(data) : data)
+    }).catch(() => this.fail('Received data that could not be decrypted.'))
+  }
+
+  async drained() {
+    while (this.open && this.bufferedAmount > lowWater) await delay(30)
+  }
+
+  private fail(reason: string) {
+    if (!this.open) return
+    this.open = false
+    this.onFail(reason)
+  }
+
+  close() {
+    this.open = false
+  }
+}
+
 class Meter {
   private at = performance.now()
   private bytes = 0
@@ -131,9 +308,9 @@ type LinkOptions = {
   peerId: string
   iceServers: RTCIceServer[]
   sendSignal: (data: Signal) => void
+  relay: RelayTransport
   events: LinkEvents
-  askBeforeInternet: () => boolean
-  confirmInternet: ConfirmInternet
+  confirmRoute: ConfirmRoute
   onClose: () => void
 }
 
@@ -150,9 +327,19 @@ export class PeerLink {
   private readonly opened: Promise<void>
   private readonly options: LinkOptions
   private readonly events: LinkEvents
+  private mode: 'direct' | 'relay' = 'direct'
+  private pipe: Pipe | null = null
+  private heardFromRemote = false
+  private relayKeys: Promise<RelayKeys> | null = null
+  private relayKeySent = false
+  private directTimer = 0
+  private relayTimer = 0
+  private localCandidates = new Set<string>()
+  private remoteCandidates = new Set<string>()
   private makingOffer = false
   private ignoreOffer = false
   private signalQueue = Promise.resolve()
+  private resolveOpen: () => void = () => {}
   private rejectOpen: (error: Error) => void = () => {}
   private wakeSender: (() => void) | null = null
   private sendQueue: File[][] = []
@@ -166,6 +353,12 @@ export class PeerLink {
     this.events = options.events
     this.peerId = options.peerId
     this.polite = options.selfId > options.peerId
+    this.opened = new Promise<void>((resolve, reject) => {
+      this.resolveOpen = resolve
+      this.rejectOpen = reject
+    })
+    this.opened.catch(() => {})
+
     this.pc = new RTCPeerConnection({ iceServers: options.iceServers })
     // A pre-negotiated channel lets either side start the connection without
     // waiting for the other to announce it.
@@ -174,7 +367,9 @@ export class PeerLink {
     this.channel.bufferedAmountLowThreshold = lowWater
 
     this.pc.onicecandidate = ({ candidate }) => {
-      if (candidate) this.signal({ candidate: candidate.toJSON() })
+      if (!candidate) return
+      if (candidate.type) this.localCandidates.add(candidate.type)
+      this.signal({ candidate: candidate.toJSON() })
     }
     this.pc.onnegotiationneeded = async () => {
       try {
@@ -187,30 +382,31 @@ export class PeerLink {
         this.makingOffer = false
       }
     }
-    this.pc.onconnectionstatechange = () => {
-      if (this.pc.connectionState === 'failed') this.close('The connection to that device dropped.')
+    this.pc.oniceconnectionstatechange = () => {
+      if (this.pc.iceConnectionState === 'failed') this.directFailed('no network path between the devices')
     }
-
-    this.opened = new Promise<void>((resolve, reject) => {
-      const timer = window.setTimeout(() => {
-        const error = new Error('Could not reach that device. Put both devices on the same Wi-Fi, or connect one to the other\'s hotspot, and keep PexyDrop open on both.')
-        reject(error)
-        this.close(error.message)
-      }, connectTimeout)
-      this.rejectOpen = (error) => {
-        window.clearTimeout(timer)
-        reject(error)
-      }
-      this.channel.onopen = async () => {
-        window.clearTimeout(timer)
-        this.route = await this.detectRoute()
-        this.events.route(this.peerId, this.route)
-        resolve()
-      }
-    })
-    this.opened.catch(() => {})
+    this.pc.onconnectionstatechange = () => {
+      if (this.pc.connectionState !== 'failed') return
+      if (this.pipe) this.close('The connection to that device dropped.')
+      else this.directFailed('the connection failed')
+    }
+    this.channel.onopen = async () => {
+      if (this.mode !== 'direct' || this.closed) return
+      window.clearTimeout(this.directTimer)
+      this.pipe = new ChannelPipe(this.channel)
+      this.route = await this.detectRoute()
+      this.events.route(this.peerId, this.route)
+      this.resolveOpen()
+    }
     this.channel.onmessage = (event) => this.receive(event.data)
-    this.channel.onclose = () => this.close('That device disconnected.')
+    this.channel.onclose = () => {
+      if (this.mode === 'direct') this.close('That device disconnected.')
+    }
+    this.directTimer = window.setTimeout(() => this.directFailed('it took too long'), directTimeout)
+  }
+
+  get isDirectOpen() {
+    return this.mode === 'direct' && Boolean(this.pipe?.open)
   }
 
   private signal(data: Omit<Signal, 'session'>) {
@@ -220,8 +416,18 @@ export class PeerLink {
   // "Perfect negotiation": either side may start, and the polite side yields when
   // both send offers at the same moment.
   handleSignal(data: Signal) {
+    this.heardFromRemote = true
+    if (data.relayKey) {
+      void this.acceptRelay(data.relayKey)
+      return
+    }
+    if (this.mode === 'relay') return
+    if (data.candidate?.candidate) {
+      const type = / typ (\w+)/.exec(data.candidate.candidate)?.[1]
+      if (type) this.remoteCandidates.add(type)
+    }
     this.signalQueue = this.signalQueue.then(async () => {
-      if (this.closed) return
+      if (this.closed || this.mode === 'relay') return
       const { description, candidate } = data
       try {
         if (description) {
@@ -244,6 +450,74 @@ export class PeerLink {
         console.warn('Connection handshake failed', error)
       }
     })
+  }
+
+  private directFailed(reason: string) {
+    if (this.closed || this.mode !== 'direct' || this.pipe) return
+    window.clearTimeout(this.directTimer)
+    // No reply at all means the other device is asleep or closed, and the relay
+    // won't help either.
+    if (!this.heardFromRemote) return this.fail(notResponding)
+    console.info(`[PexyDrop] Direct connection failed (${reason}); using the relay.`, {
+      localCandidates: [...this.localCandidates],
+      remoteCandidates: [...this.remoteCandidates],
+      iceState: this.pc.iceConnectionState,
+    })
+    this.enterRelayMode()
+    this.relayTimer = window.setTimeout(() => this.fail(notResponding), relayTimeout)
+    void this.sendRelayKey()
+  }
+
+  private enterRelayMode() {
+    if (this.mode === 'relay') return
+    this.mode = 'relay'
+    window.clearTimeout(this.directTimer)
+    this.pipe = null
+    this.pc.onicecandidate = null
+    this.pc.oniceconnectionstatechange = null
+    this.pc.onconnectionstatechange = null
+    this.channel.onopen = null
+    this.channel.onmessage = null
+    this.channel.onclose = null
+    this.channel.close()
+    this.pc.close()
+  }
+
+  private async sendRelayKey() {
+    if (this.relayKeySent) return
+    this.relayKeySent = true
+    this.relayKeys ??= createRelayKeys()
+    try {
+      this.signal({ relayKey: (await this.relayKeys).publicKey })
+    } catch {
+      this.fail('Could not set up an encrypted connection.')
+    }
+  }
+
+  private async acceptRelay(remoteKey: string) {
+    if (this.closed || this.pipe instanceof RelayPipe) return
+    this.enterRelayMode()
+    void this.sendRelayKey()
+    try {
+      this.relayKeys ??= createRelayKeys()
+      const key = await deriveRelayKey(await this.relayKeys, remoteKey)
+      if (this.closed) return
+      this.pipe = new RelayPipe(this.peerId, this.options.relay, key, (data) => this.receive(data), (reason) => this.close(reason))
+      window.clearTimeout(this.relayTimer)
+      this.route = 'relay'
+      this.events.route(this.peerId, this.route)
+      this.resolveOpen()
+    } catch (error) {
+      this.fail(error instanceof Error ? error.message : 'Could not set up an encrypted connection.')
+    }
+  }
+
+  receiveRelay(frame: Uint8Array) {
+    if (this.pipe instanceof RelayPipe) this.pipe.receive(frame)
+  }
+
+  signalingLost() {
+    if (this.mode === 'relay') this.close('Lost the connection to the PexyDrop server.')
   }
 
   // Works out whether the chosen path stays on the local network. The connection
@@ -282,7 +556,7 @@ export class PeerLink {
   }
 
   private control(message: Control) {
-    if (this.channel.readyState === 'open') this.channel.send(JSON.stringify(message))
+    if (this.pipe?.open) this.pipe.send(JSON.stringify(message))
   }
 
   private update(transfer: Transfer, patch: Partial<Transfer>) {
@@ -297,15 +571,15 @@ export class PeerLink {
     })
   }
 
-  private drain() {
+  // Waits for the send buffer to empty, or for a cancel.
+  private drain(pipe: Pipe) {
     return new Promise<void>((resolve) => {
       const done = () => {
-        this.channel.removeEventListener('bufferedamountlow', done)
         this.wakeSender = null
         resolve()
       }
       this.wakeSender = done
-      this.channel.addEventListener('bufferedamountlow', done)
+      void pipe.drained().then(done)
     })
   }
 
@@ -336,7 +610,7 @@ export class PeerLink {
     this.events.transfer({ ...transfer })
     try {
       await this.opened
-      if (this.route === 'internet' && this.options.askBeforeInternet() && !(await this.options.confirmInternet(this.peerId, total))) {
+      if (this.route && this.route !== 'local' && !(await this.options.confirmRoute(this.peerId, this.route, total))) {
         state.cancelled = true
       }
       if (state.cancelled) throw new Error('Cancelled')
@@ -369,9 +643,10 @@ export class PeerLink {
       for (let offset = 0; offset < file.size; offset += readSize) {
         const buffer = await file.slice(offset, offset + readSize).arrayBuffer()
         for (let position = 0; position < buffer.byteLength; position += chunkSize) {
-          if (this.channel.bufferedAmount > highWater) await this.drain()
-          if (state.cancelled || this.closed) throw new Error('Cancelled')
-          this.channel.send(buffer.slice(position, position + chunkSize))
+          const pipe = this.pipe
+          if (pipe && pipe.bufferedAmount > highWater) await this.drain(pipe)
+          if (state.cancelled || this.closed || !this.pipe?.open) throw new Error(state.cancelled ? 'Cancelled' : 'The connection to that device dropped.')
+          this.pipe.send(buffer.slice(position, position + chunkSize))
         }
         sent += buffer.byteLength
         if (meter.sample(sent)) this.update(transfer, { transferred: sent, speed: meter.speed })
@@ -533,9 +808,16 @@ export class PeerLink {
     }
   }
 
+  private fail(reason: string) {
+    this.rejectOpen(new Error(reason))
+    this.close(reason)
+  }
+
   close(reason: string) {
     if (this.closed) return
     this.closed = true
+    window.clearTimeout(this.directTimer)
+    window.clearTimeout(this.relayTimer)
     const error = new Error(reason)
     this.rejectOpen(error)
     this.sendQueue = []
@@ -546,6 +828,7 @@ export class PeerLink {
     if (this.pendingOffer) this.events.offerWithdrawn(this.pendingOffer.id)
     this.pendingOffer = null
     this.events.route(this.peerId, null)
+    this.pipe?.close()
     this.channel.close()
     this.pc.close()
     this.options.onClose()
@@ -554,18 +837,19 @@ export class PeerLink {
 
 export class PeerManager {
   private readonly links = new Map<string, PeerLink>()
+  private readonly missing = new Map<string, number>()
   private readonly sendSignal: (to: string, data: Signal) => void
+  private readonly relay: RelayTransport
   private readonly events: LinkEvents
-  private readonly askBeforeInternet: () => boolean
-  private readonly confirmInternet: ConfirmInternet
+  private readonly confirmRoute: ConfirmRoute
   private iceServers = defaultIceServers
   private selfId = ''
 
-  constructor(sendSignal: (to: string, data: Signal) => void, events: LinkEvents, askBeforeInternet: () => boolean, confirmInternet: ConfirmInternet) {
+  constructor(sendSignal: (to: string, data: Signal) => void, relay: RelayTransport, events: LinkEvents, confirmRoute: ConfirmRoute) {
     this.sendSignal = sendSignal
+    this.relay = relay
     this.events = events
-    this.askBeforeInternet = askBeforeInternet
-    this.confirmInternet = confirmInternet
+    this.confirmRoute = confirmRoute
   }
 
   setSelf(id: string, iceServers?: RTCIceServer[]) {
@@ -582,9 +866,9 @@ export class PeerManager {
       peerId,
       iceServers: this.iceServers,
       sendSignal: (data) => this.sendSignal(peerId, data),
+      relay: this.relay,
       events: this.events,
-      askBeforeInternet: this.askBeforeInternet,
-      confirmInternet: this.confirmInternet,
+      confirmRoute: this.confirmRoute,
       onClose: () => {
         if (this.links.get(peerId) === link) this.links.delete(peerId)
       },
@@ -601,7 +885,7 @@ export class PeerManager {
     // A new session from the other side means it reloaded or rebuilt its
     // connection, so start over instead of mixing two handshakes.
     if (link && !link.closed && link.remoteSession && link.remoteSession !== signal.session) {
-      if (signal.description?.type !== 'offer') return
+      if (signal.description?.type !== 'offer' && !signal.relayKey) return
       link.close('Reconnecting to that device.')
       link = undefined
     }
@@ -610,13 +894,35 @@ export class PeerManager {
     link.handleSignal(signal)
   }
 
+  handleRelay(from: string, frame: Uint8Array) {
+    this.links.get(from)?.receiveRelay(frame)
+  }
+
+  signalingLost() {
+    for (const link of this.links.values()) link.signalingLost()
+  }
+
+  // A device can vanish from the list for a moment while its phone reconnects.
+  // Give it time to come back, and never cut a direct connection that still works.
   sync(peerIds: Set<string>) {
+    for (const [peerId, timer] of this.missing) {
+      if (!peerIds.has(peerId)) continue
+      window.clearTimeout(timer)
+      this.missing.delete(peerId)
+    }
     for (const [peerId, link] of this.links) {
-      if (!peerIds.has(peerId)) link.close('That device went offline.')
+      if (peerIds.has(peerId) || this.missing.has(peerId)) continue
+      this.missing.set(peerId, window.setTimeout(() => {
+        this.missing.delete(peerId)
+        const current = this.links.get(peerId)
+        if (current === link && !link.isDirectOpen) link.close('That device went offline.')
+      }, 12_000))
     }
   }
 
   closeAll() {
+    for (const timer of this.missing.values()) window.clearTimeout(timer)
+    this.missing.clear()
     for (const link of this.links.values()) link.close('Disconnected.')
     this.links.clear()
   }

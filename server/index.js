@@ -15,6 +15,10 @@ const isDev = process.env.NODE_ENV === 'development'
 const behindProxy = Boolean(process.env.RENDER || process.env.TRUST_PROXY)
 const roomAlphabet = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789'
 const maxFailedJoins = 8
+// When a receiver can't keep up with relayed data, pause the sender's socket
+// instead of buffering without limit on the server.
+const relayHighWater = 8 * 1024 * 1024
+const relayLowWater = 1024 * 1024
 // A pairing code outlives a brief disconnect, such as a phone locking its screen.
 const roomGraceMs = 2 * 60_000
 
@@ -29,8 +33,9 @@ const rooms = new Map()
 const peersBySocket = new Map()
 
 /**
- * @typedef {{ id: string, name: string, device: string, detail: string, socket: import('ws').WebSocket,
- *   networkRoom: string, codeRoom: string | null, failedJoins: number, alive: boolean }} Peer
+ * @typedef {{ id: string, name: string, device: string, detail: string, cellular: boolean,
+ *   socket: import('ws').WebSocket, networkRoom: string, codeRoom: string | null, failedJoins: number,
+ *   alive: boolean, paused: boolean }} Peer
  */
 
 // A TURN relay forwards the still-encrypted data when two devices on different
@@ -129,6 +134,7 @@ function visiblePeers(peer) {
         name: other.name,
         device: other.device,
         detail: other.detail,
+        cellular: other.cellular,
         via: existing?.via === 'network' || key === peer.networkRoom ? 'network' : 'code',
       })
     }
@@ -138,6 +144,33 @@ function visiblePeers(peer) {
 
 function canSee(peer, other) {
   return peer.networkRoom === other.networkRoom || Boolean(peer.codeRoom && peer.codeRoom === other.codeRoom)
+}
+
+// Only devices that can already see each other may exchange messages.
+function findVisible(peer, id) {
+  const target = [...(rooms.get(peer.networkRoom) ?? []), ...(rooms.get(peer.codeRoom ?? '') ?? [])]
+    .find((other) => other.id === id)
+  return target && canSee(peer, target) ? target : undefined
+}
+
+// Binary frames carry relayed transfer data when a direct connection can't be
+// made. They start with the 12-character id of the recipient, which the server
+// swaps for the sender's id. The payload is encrypted by the devices.
+function relayFrame(peer, raw) {
+  if (raw.length < 13) return
+  const target = findVisible(peer, raw.toString('latin1', 0, 12))
+  if (!target || target.socket.readyState !== target.socket.OPEN) return
+  raw.write(peer.id, 0, 'latin1')
+  target.socket.send(raw, { binary: true })
+  if (peer.paused || target.socket.bufferedAmount < relayHighWater) return
+  peer.paused = true
+  peer.socket.pause()
+  const check = () => {
+    if (target.socket.readyState === target.socket.OPEN && target.socket.bufferedAmount > relayLowWater) return void setTimeout(check, 50)
+    peer.paused = false
+    peer.socket.resume()
+  }
+  setTimeout(check, 50)
 }
 
 function broadcastRooms(...keys) {
@@ -201,7 +234,7 @@ app.get('*path', (_req, res, next) => {
 })
 
 const server = createServer(app)
-const wss = new WebSocketServer({ server, path: '/ws', maxPayload: 64 * 1024 })
+const wss = new WebSocketServer({ server, path: '/ws', maxPayload: 256 * 1024 })
 
 wss.on('connection', (socket, request) => {
   /** @type {Peer} */
@@ -210,18 +243,24 @@ wss.on('connection', (socket, request) => {
     name: 'Unnamed device',
     device: 'desktop',
     detail: '',
+    cellular: false,
     socket,
     networkRoom: networkKey(clientAddress(request)),
     codeRoom: null,
     failedJoins: 0,
     alive: true,
+    paused: false,
   }
   let introduced = false
   peersBySocket.set(socket, peer)
 
   socket.on('pong', () => { peer.alive = true })
 
-  socket.on('message', (raw) => {
+  socket.on('message', (raw, isBinary) => {
+    if (isBinary) {
+      if (introduced) relayFrame(peer, /** @type {Buffer} */ (raw))
+      return
+    }
     let message
     try {
       message = JSON.parse(String(raw))
@@ -234,18 +273,28 @@ wss.on('connection', (socket, request) => {
       peer.id = peerIdFrom(message.secret)
       for (const [otherSocket, other] of peersBySocket) {
         if (other === peer || other.id !== peer.id) continue
+        // The same tab reconnecting (phones drop sockets when they sleep or open
+        // the file picker). Take over its place without announcing a departure,
+        // or other devices would tear down their connection to it.
         peersBySocket.delete(otherSocket)
-        dropPeer(other)
+        leaveRoom(other, other.networkRoom)
+        if (other.networkRoom !== peer.networkRoom) broadcastRooms(other.networkRoom)
+        if (other.codeRoom) {
+          leaveRoom(other, other.codeRoom)
+          peer.codeRoom = other.codeRoom
+          joinRoom(peer, peer.codeRoom)
+        }
         otherSocket.terminate()
       }
       peer.name = cleanName(message.name)
       peer.device = cleanDevice(message.device)
       peer.detail = cleanText(message.detail)
+      peer.cellular = message.cellular === true
       void iceServers().then((servers) => {
         if (socket.readyState !== socket.OPEN || peersBySocket.get(socket) !== peer) return
         joinRoom(peer, peer.networkRoom)
         send(peer, { type: 'welcome', id: peer.id, iceServers: servers })
-        broadcastRooms(peer.networkRoom)
+        broadcastRooms(peer.networkRoom, peer.codeRoom)
       })
       return
     }
@@ -254,6 +303,10 @@ wss.on('connection', (socket, request) => {
     switch (message.type) {
       case 'rename':
         peer.name = cleanName(message.name)
+        broadcastRooms(peer.networkRoom, peer.codeRoom)
+        break
+      case 'status':
+        peer.cellular = message.cellular === true
         broadcastRooms(peer.networkRoom, peer.codeRoom)
         break
       case 'create-room': {
@@ -273,7 +326,10 @@ wss.on('connection', (socket, request) => {
           if (peer.failedJoins >= maxFailedJoins) socket.close(4008, 'Too many attempts')
           break
         }
-        if (peer.codeRoom === key) break
+        if (peer.codeRoom === key) {
+          send(peer, { type: 'room', code })
+          break
+        }
         leaveCodeRoom(peer)
         peer.codeRoom = key
         joinRoom(peer, key)
@@ -286,10 +342,8 @@ wss.on('connection', (socket, request) => {
         send(peer, { type: 'room', code: null })
         break
       case 'signal': {
-        // Only relay between devices that can already see each other.
-        const target = [...(rooms.get(peer.networkRoom) ?? []), ...(rooms.get(peer.codeRoom ?? '') ?? [])]
-          .find((other) => other.id === message.to)
-        if (target && canSee(peer, target)) send(target, { type: 'signal', from: peer.id, data: message.data })
+        const target = findVisible(peer, message.to)
+        if (target) send(target, { type: 'signal', from: peer.id, data: message.data })
         break
       }
     }

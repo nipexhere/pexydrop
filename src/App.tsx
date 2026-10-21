@@ -22,6 +22,7 @@ import {
   MessageSquareText,
   Pencil,
   Send,
+  Server,
   Share2,
   ShieldCheck,
   Signal as SignalIcon,
@@ -45,7 +46,7 @@ type Received =
   | { id: string; kind: 'text'; text: string; from: string; at: number }
 
 type Staged = { files: File[]; text: string }
-type DataPrompt = { peerId: string; bytes: number; resolve: (send: boolean) => void }
+type DataPrompt = { peerId: string; route: Route; bytes: number; resolve: (send: boolean) => void }
 
 const roomStorage = 'pexydrop-room'
 const secretStorage = 'pexydrop-secret'
@@ -262,6 +263,10 @@ export default function App() {
     const manager = new PeerManager(
       (to, data) => signalingRef.current?.send({ type: 'signal', to, data }),
       {
+        send: (to, payload) => signalingRef.current?.sendBinary(to, payload) ?? false,
+        bufferedAmount: () => signalingRef.current?.bufferedAmount ?? 0,
+      },
+      {
         transfer: (transfer) => {
           setTransfers((current) => ({ ...current, [transfer.peerId]: transfer }))
           if (transfer.status === 'failed' && transfer.error) setToast(transfer.error)
@@ -324,13 +329,19 @@ export default function App() {
           return next
         }),
       },
-      () => askBeforeDataRef.current,
-      (peerId, bytes) => new Promise<boolean>((resolve) => setDataPrompt({ peerId, bytes, resolve })),
+      (peerId, route, bytes) => {
+        if (!askBeforeDataRef.current) return Promise.resolve(true)
+        // Relaying between two devices on the same Wi-Fi uses that Wi-Fi's internet
+        // connection, not mobile data, so there is nothing to ask about.
+        const peer = peersRef.current.find((item) => item.id === peerId)
+        if (route === 'relay' && peer?.via === 'network' && !peer.cellular && !onCellular()) return Promise.resolve(true)
+        return new Promise<boolean>((resolve) => setDataPrompt({ peerId, route, bytes, resolve }))
+      },
     )
     managerRef.current = manager
 
     const signaling = new Signaling(
-      () => ({ name: nameRef.current, device: thisDevice, detail: describeDevice(), secret: tabSecret() }),
+      () => ({ name: nameRef.current, device: thisDevice, detail: describeDevice(), secret: tabSecret(), cellular: onCellular() }),
       (message) => {
         switch (message.type) {
           case 'welcome': {
@@ -375,7 +386,11 @@ export default function App() {
             break
         }
       },
-      setOnline,
+      (from, frame) => manager.handleRelay(from, frame),
+      (isOnline) => {
+        setOnline(isOnline)
+        if (!isOnline) manager.signalingLost()
+      },
     )
     signalingRef.current = signaling
 
@@ -414,7 +429,10 @@ export default function App() {
 
   useEffect(() => {
     const connection = (navigator as Navigator & { connection?: EventTarget }).connection
-    const update = () => setCellular(onCellular())
+    const update = () => {
+      setCellular(onCellular())
+      signalingRef.current?.send({ type: 'status', cellular: onCellular() })
+    }
     connection?.addEventListener('change', update)
     return () => connection?.removeEventListener('change', update)
   }, [])
@@ -691,7 +709,7 @@ export default function App() {
                     </button>
                     <div className="device-foot">
                       <span className={`route-badge ${route === 'internet' ? 'is-internet' : ''}`}>
-                        {route === 'internet' ? <><Globe size={12} /> Internet</> : route === 'local' ? <><Wifi size={12} /> Local</> : peer.via === 'code' ? <><Link2 size={12} /> Paired</> : <><Wifi size={12} /> Nearby</>}
+                        {route === 'relay' ? <><Server size={12} /> Via server</> : route === 'internet' ? <><Globe size={12} /> Internet</> : route === 'local' ? <><Wifi size={12} /> Local</> : peer.via === 'code' ? <><Link2 size={12} /> Paired</> : <><Wifi size={12} /> Nearby</>}
                       </span>
                       <span className="foot-actions">
                         {isTrusted && (
@@ -886,8 +904,12 @@ export default function App() {
         <div className="backdrop">
           <section className="dialog" role="alertdialog" aria-modal="true" aria-labelledby="data-title">
             <span className="dialog-mark is-warning"><SignalIcon size={20} /></span>
-            <h2 id="data-title">Send over the internet?</h2>
-            <p className="dialog-copy">{promptPeer?.name ?? 'That device'} isn't on your Wi-Fi or hotspot, so this {formatBytes(dataPrompt.bytes)} transfer would go over the internet and may use mobile data.</p>
+            <h2 id="data-title">{dataPrompt.route === 'relay' ? 'Send through the server?' : 'Send over the internet?'}</h2>
+            <p className="dialog-copy">
+              {dataPrompt.route === 'relay'
+                ? `This network won't let the devices connect directly, so this ${formatBytes(dataPrompt.bytes)} transfer would go through PexyDrop's server, still encrypted. It uses your internet connection, which may be mobile data.`
+                : `${promptPeer?.name ?? 'That device'} isn't on your Wi-Fi or hotspot, so this ${formatBytes(dataPrompt.bytes)} transfer would go over the internet and may use mobile data.`}
+            </p>
             <p className="dialog-tip"><Wifi size={14} /> To send for free, join the same Wi-Fi, or connect one device to the other's hotspot.</p>
             <div className="dialog-actions">
               <button className="secondary-button" onClick={() => answerDataPrompt(false)}>Don't send</button>
@@ -903,9 +925,9 @@ export default function App() {
             <span className="dialog-mark"><Download size={20} /></span>
             <p className="eyebrow"><span /> INCOMING</p>
             <h2 id="offer-title">{offerFrom?.name ?? 'A nearby device'} wants to send you {plural(offer.files.length, 'file')}</h2>
-            <p className="dialog-copy">{formatBytes(offer.total)} total{routes[offer.peerId] === 'internet' ? '' : ' · over your local network'}{folder ? ` · saves to ${folder.name || 'your folder'}` : ''}</p>
-            {routes[offer.peerId] === 'internet' && (
-              <p className="dialog-warning"><TriangleAlert size={15} /> Not on your Wi-Fi. This may use about {formatBytes(offer.total)} of mobile data.</p>
+            <p className="dialog-copy">{formatBytes(offer.total)} total{routes[offer.peerId] === 'relay' ? ' · through the server, encrypted' : routes[offer.peerId] === 'internet' ? '' : ' · over your local network'}{folder ? ` · saves to ${folder.name || 'your folder'}` : ''}</p>
+            {(routes[offer.peerId] === 'internet' || (routes[offer.peerId] === 'relay' && (cellular || offerFrom?.cellular))) && (
+              <p className="dialog-warning"><TriangleAlert size={15} /> This may use about {formatBytes(offer.total)} of mobile data.</p>
             )}
             <ul className="offer-files">
               {offer.files.slice(0, 4).map((file, index) => {
