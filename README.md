@@ -1,43 +1,53 @@
 # PexyDrop
 
-PexyDrop is a private file-transfer web app for moving files between a phone and a laptop. On a local install, the laptop hosts the transfer service and the phone joins through a QR code. Files move directly over the local network; there is no account or cloud relay.
+PexyDrop sends files between nearby phones and computers over Wi-Fi, straight from one device to the other. Open it on two devices on the same network, tap the device you want to send to, and the other person taps **Accept**. No accounts, no app install, no passwords, and files are never uploaded to a server.
+
+## How it works
+
+- **Discovery.** Devices on the same Wi-Fi share a public address, so the server groups them and they see each other automatically.
+- **Direct, encrypted transfer.** Files travel over a WebRTC data channel, which is encrypted end to end with DTLS. The server only relays the short handshake messages and never sees file contents. No relay (TURN) server is configured, so file data cannot pass through a third party.
+- **Wi-Fi only (on by default).** Each connection checks whether it runs over the local network. If it would go over the internet or mobile data, the transfer is refused. Phones on mobile data also show a warning.
+- **Consent.** Every incoming transfer needs the receiver's approval, so a stranger on the same café Wi-Fi can see your device name but can't push files to you.
+- **Pairing codes.** If automatic discovery misses a device (guest networks, VPNs, mixed IPv4/IPv6), scan the QR code or type the 6-character code. Codes are random, expire two minutes after the last device leaves, and repeated wrong guesses disconnect the client.
 
 ## Features
 
-- QR pairing and a copyable device link
-- Phone-to-laptop and laptop-to-phone transfers
-- Drag-and-drop and multi-file uploads with progress
-- Disk-backed uploads and streamed individual or ZIP downloads
-- File search, storage totals, and removal controls
-- A random session key, plus a required passphrase when hosted publicly
-- Responsive phone and desktop layouts
+- Send files in either direction, any type and size, with live progress and speed
+- Send text and links, with Copy and Open buttons on arrival
+- Drag and drop onto a device, or paste files or text anywhere on the page
+- Image thumbnails, Save, Save all, and the phone share sheet ("Save to Photos")
+- Device names you can rename, which survive reloads and brief disconnects
+- Installable as an app. On Android, the installed app appears in the share sheet, so you can share photos straight from the gallery to PexyDrop.
+- Light and dark themes, phone and desktop layouts
 
-## Run Locally
+## Run locally
 
 ```powershell
 npm install
 npm run dev
 ```
 
-Open `http://localhost:5174` on the laptop. Scan the QR code with a phone on the same Wi-Fi. If Windows Firewall asks, allow Node.js on private networks. The production-style local server can be run with `npm run build` followed by `npm start`.
+Open `http://localhost:5174` on the laptop, then scan the QR code with your phone. If Windows Firewall asks, allow Node.js on private networks.
 
-Received files are staged in the operating system's temporary directory by default. Remove files from the app when finished; temporary files may also remain until the OS cleans that directory. Set `TRANSFER_STORAGE` to choose another location.
+To run the production build on your laptop so other devices on your Wi-Fi can use it:
+
+```powershell
+npm run build
+npm start
+```
+
+The terminal prints the `http://192.168.x.x:4173` address to open on other devices. Installing the app and the share sheet need HTTPS, so they only work on the hosted version.
 
 ## Deploy on Render
 
-This repository includes a Render Blueprint. Push it to GitHub, then create a new Blueprint in Render from the repository. During setup, Render asks for `TRANSFER_PASSWORD`; choose a strong passphrase and share it only with the people transferring files. The deployed URL uses the hosted server as a relay, rather than a direct LAN connection.
+Push to GitHub and create a Blueprint in Render from the repository. There is nothing to configure. Because the server only introduces devices and doesn't store files, the free plan works well. It may sleep when idle, so the first visit can take a few seconds to wake it up.
 
-The included free service uses temporary storage and may sleep when idle. Files can disappear when the service restarts, and the hosting plan or proxy can impose upload-size and duration limits. For very large or sensitive corporate transfers, run PexyDrop on the laptop over a trusted local network or use a deployment with reviewed limits, persistent storage, and an appropriate security policy. Local HTTP is not encrypted; public Render traffic is served through HTTPS.
+## Limits
+
+- Both devices must keep the page open during a transfer.
+- Received files are held in the browser until you save them, so very large transfers (several GB) depend on the receiving device's memory.
+- Some networks (guest Wi-Fi, "client isolation") block devices from reaching each other. Use a different network or turn off Wi-Fi only to connect over the internet.
 
 ## Stack
 
-- React 19, TypeScript, and Vite 7
-- Node.js 24 and Express 5
-- Multer 2 for disk-backed multipart uploads
-- Archiver 7 for streamed ZIP downloads
-- `qrcode.react` for QR codes
-- Lucide React for interface icons
-
-## Portfolio Summary
-
-**PexyDrop** is a QR-paired file-transfer app that moves files between phones and computers. It supports multi-file uploads, large disk-backed transfers, streamed downloads, and private LAN operation, with an optional password gate for hosted deployments.
+React 19, TypeScript and Vite 7 on the client. Node.js 24, Express 5 and `ws` for signaling. WebRTC data channels for transfers.

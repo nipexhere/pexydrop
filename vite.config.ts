@@ -6,14 +6,8 @@ export default defineConfig({
   server: {
     host: '0.0.0.0',
     proxy: {
-      '/api': {
-        target: 'http://127.0.0.1:4173',
-        configure(proxy) {
-          proxy.on('proxyReq', (proxyRequest, request) => {
-            proxyRequest.setHeader('x-nearby-client-address', request.socket.remoteAddress ?? '')
-          })
-        },
-      },
+      '/api': 'http://127.0.0.1:4173',
+      '/ws': { target: 'ws://127.0.0.1:4173', ws: true },
     },
   },
 })

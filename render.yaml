@@ -9,7 +9,3 @@ services:
     envVars:
       - key: NODE_VERSION
         value: 24.21.0
-      - key: TRANSFER_STORAGE
-        value: /tmp/pexydrop-files
-      - key: TRANSFER_PASSWORD
-        sync: false

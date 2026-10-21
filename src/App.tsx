@@ -1,49 +1,85 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from 'react'
+import { useEffect, useMemo, useRef, useState, type DragEvent, type FormEvent } from 'react'
 import {
-  ArrowDownToLine,
   ArrowLeftRight,
   Check,
   Copy,
   Download,
-  File,
+  ExternalLink,
+  File as FileGlyph,
   FileArchive,
   FileAudio,
   FileImage,
   FileText,
   FileVideo,
-  HardDrive,
+  Globe,
   Laptop,
-  LoaderCircle,
-  RefreshCw,
-  Search,
+  Link2,
+  LogOut,
+  MessageSquareText,
+  Pencil,
+  Send,
+  Share2,
   ShieldCheck,
+  Signal as SignalIcon,
   Smartphone,
+  Tablet,
   Trash2,
   Upload,
   Wifi,
   X,
 } from 'lucide-react'
 import { QRCodeSVG } from 'qrcode.react'
+import { describeDevice, detectDevice, loadDeviceName, saveDeviceName, type DeviceKind } from './lib/identity'
+import { makeId, onCellular, PeerManager, type IncomingOffer, type Route, type Transfer } from './lib/peer'
+import { Signaling, type RemotePeer } from './lib/signaling'
 
-type TransferFile = {
-  id: string
-  name: string
-  size: number
-  type: string
-  createdAt: string
+type Received =
+  | { id: string; kind: 'file'; file: File; url: string; from: string; at: number }
+  | { id: string; kind: 'text'; text: string; from: string; at: number }
+
+type Staged = { files: File[]; text: string }
+
+const roomStorage = 'pexydrop-room'
+const secretStorage = 'pexydrop-secret'
+const wifiOnlyStorage = 'pexydrop-wifi-only'
+const shareCache = 'pexydrop-share'
+const terminal = new Set(['done', 'declined', 'cancelled', 'failed'])
+const thisDevice = detectDevice()
+
+function storageGet(storage: () => Storage, key: string) {
+  try {
+    return storage().getItem(key)
+  } catch {
+    return null
+  }
 }
 
-type ServerInfo = {
-  addresses: string[]
-  pairingKey: string | null
-  port: number
-  publicUrl: string | null
-  requiresPassword: boolean
-  setupRequired: boolean
+function storageSet(storage: () => Storage, key: string, value: string | null) {
+  try {
+    if (value === null) storage().removeItem(key)
+    else storage().setItem(key, value)
+  } catch {
+    // Storage can be unavailable in private browsing; settings then last for this visit.
+  }
 }
 
-const keyStorage = 'pexydrop-pairing-key'
-const passwordStorage = 'pexydrop-transfer-password'
+// Per tab, so two tabs on one laptop appear as two devices.
+function tabSecret() {
+  const saved = storageGet(() => sessionStorage, secretStorage)
+  if (saved) return saved
+  const secret = makeId() + makeId()
+  storageSet(() => sessionStorage, secretStorage, secret)
+  return secret
+}
+
+function takeUrlParam(name: string) {
+  const url = new URL(location.href)
+  const value = url.searchParams.get(name)
+  if (value === null) return null
+  url.searchParams.delete(name)
+  history.replaceState(null, '', url.pathname + url.search + url.hash)
+  return value
+}
 
 function formatBytes(bytes: number) {
   if (bytes < 1024) return `${bytes} B`
@@ -63,309 +99,672 @@ function fileIcon(type: string) {
   if (type.startsWith('audio/')) return FileAudio
   if (type.includes('zip') || type.includes('compressed')) return FileArchive
   if (type.includes('text') || type.includes('pdf')) return FileText
-  return File
+  return FileGlyph
 }
 
-function getApiKey() {
-  const fromUrl = new URLSearchParams(window.location.search).get('key')
-  if (fromUrl) {
-    localStorage.setItem(keyStorage, fromUrl)
-    return fromUrl
+function deviceIcon(device: DeviceKind) {
+  if (device === 'phone') return Smartphone
+  if (device === 'tablet') return Tablet
+  return Laptop
+}
+
+function formatCode(code: string) {
+  return `${code.slice(0, 3)} ${code.slice(3)}`
+}
+
+function isLink(text: string) {
+  return /^https?:\/\/\S+$/i.test(text.trim())
+}
+
+function plural(count: number, word: string) {
+  return `${count} ${word}${count === 1 ? '' : 's'}`
+}
+
+function describeTransfer(transfer: Transfer) {
+  const percent = transfer.total ? Math.min(100, Math.round((transfer.transferred / transfer.total) * 100)) : 0
+  const speed = transfer.speed > 0 ? ` · ${formatBytes(transfer.speed)}/s` : ''
+  switch (transfer.status) {
+    case 'connecting': return 'Connecting…'
+    case 'waiting': return 'Waiting for them to accept'
+    case 'sending': return `Sending ${percent}%${speed}`
+    case 'receiving': return `Receiving ${percent}%${speed}`
+    case 'done': return transfer.direction === 'send' ? `Sent ${plural(transfer.files.length, 'file')}` : `Received ${plural(transfer.files.length, 'file')}`
+    case 'declined': return 'Declined'
+    case 'cancelled': return 'Cancelled'
+    case 'failed': return 'Transfer failed'
   }
-  return localStorage.getItem(keyStorage) ?? ''
+}
+
+async function copyText(text: string) {
+  try {
+    await navigator.clipboard.writeText(text)
+    return true
+  } catch {
+    // The async clipboard needs HTTPS; fall back for plain-HTTP local hosting.
+    const area = document.createElement('textarea')
+    area.value = text
+    area.style.position = 'fixed'
+    area.style.opacity = '0'
+    document.body.append(area)
+    area.select()
+    const copied = document.execCommand('copy')
+    area.remove()
+    return copied
+  }
+}
+
+function ProgressRing({ value }: { value: number }) {
+  const radius = 33
+  const circumference = 2 * Math.PI * radius
+  return (
+    <svg className="progress-ring" viewBox="0 0 72 72" aria-hidden="true">
+      <circle cx="36" cy="36" r={radius} />
+      <circle cx="36" cy="36" r={radius} strokeDasharray={circumference} strokeDashoffset={circumference * (1 - value)} />
+    </svg>
+  )
 }
 
 export default function App() {
-  const [apiKey, setApiKey] = useState(getApiKey)
-  const [accessPassword, setAccessPassword] = useState(() => sessionStorage.getItem(passwordStorage) ?? '')
-  const [passwordInput, setPasswordInput] = useState('')
-  const [requiresPassword, setRequiresPassword] = useState(false)
-  const [isUnlocking, setIsUnlocking] = useState(false)
-  const [serverInfo, setServerInfo] = useState<ServerInfo | null>(null)
-  const [files, setFiles] = useState<TransferFile[]>([])
-  const [isOnline, setIsOnline] = useState(false)
-  const [isDragging, setIsDragging] = useState(false)
-  const [isUploading, setIsUploading] = useState(false)
-  const [uploadProgress, setUploadProgress] = useState(0)
-  const [search, setSearch] = useState('')
+  const [name, setName] = useState(loadDeviceName)
+  const [nameDraft, setNameDraft] = useState(name)
+  const [editingName, setEditingName] = useState(false)
+  const [wifiOnly, setWifiOnly] = useState(() => storageGet(() => localStorage, wifiOnlyStorage) !== 'false')
+  const [online, setOnline] = useState(false)
+  const [peers, setPeers] = useState<RemotePeer[]>([])
+  const [routes, setRoutes] = useState<Record<string, Route>>({})
+  const [transfers, setTransfers] = useState<Record<string, Transfer>>({})
+  const [offers, setOffers] = useState<IncomingOffer[]>([])
+  const [received, setReceived] = useState<Received[]>([])
+  const [shownText, setShownText] = useState<Extract<Received, { kind: 'text' }> | null>(null)
+  const [room, setRoom] = useState<string | null>(null)
+  const [roomInput, setRoomInput] = useState('')
+  const [roomError, setRoomError] = useState('')
+  const [addresses, setAddresses] = useState<string[]>([])
+  const [staged, setStaged] = useState<Staged | null>(null)
+  const [composeFor, setComposeFor] = useState<RemotePeer | null>(null)
+  const [draft, setDraft] = useState('')
+  const [dragTarget, setDragTarget] = useState<string | null>(null)
+  const [pageDrag, setPageDrag] = useState(false)
   const [toast, setToast] = useState('')
-  const [copied, setCopied] = useState(false)
-  const inputRef = useRef<HTMLInputElement>(null)
+  const [cellular, setCellular] = useState(onCellular)
+  const [copiedId, setCopiedId] = useState('')
 
-  const request = useCallback(async (url: string, init: RequestInit = {}) => {
-    const response = await fetch(url, {
-      ...init,
-      headers: { 'x-transfer-key': apiKey, ...init.headers },
-    })
-    if (!response.ok) {
-      const body = await response.json().catch(() => ({}))
-      throw new Error(body.error || `Request failed (${response.status})`)
-    }
-    return response
-  }, [apiKey])
-
-  const refreshFiles = useCallback(async () => {
-    if (!apiKey) return
-    try {
-      const response = await request('/api/files')
-      setFiles(await response.json())
-      setIsOnline(true)
-    } catch {
-      setIsOnline(false)
-    }
-  }, [apiKey, request])
+  const nameRef = useRef(name)
+  const wifiOnlyRef = useRef(wifiOnly)
+  const peersRef = useRef<RemotePeer[]>([])
+  const joinSourceRef = useRef<'url' | 'saved' | 'manual' | null>(null)
+  const signalingRef = useRef<Signaling | null>(null)
+  const managerRef = useRef<PeerManager | null>(null)
+  const pickTargetRef = useRef<string | null>(null)
+  const fileInputRef = useRef<HTMLInputElement>(null)
+  nameRef.current = name
+  wifiOnlyRef.current = wifiOnly
 
   useEffect(() => {
-    const headers: Record<string, string> = {}
-    if (apiKey) headers['x-transfer-key'] = apiKey
-    if (accessPassword) headers['x-transfer-password'] = accessPassword
-    fetch('/api/info', { headers }).then((response) => response.json()).then((info: ServerInfo) => {
-      setServerInfo(info)
-      setRequiresPassword(info.requiresPassword)
-      if (info.requiresPassword) {
-        localStorage.removeItem(keyStorage)
-        setApiKey('')
-      }
-      if (info.pairingKey) {
-        localStorage.setItem(keyStorage, info.pairingKey)
-        setApiKey(info.pairingKey)
-      }
-    }).catch(() => setIsOnline(false))
+    const peerName = (peerId: string) => peersRef.current.find((peer) => peer.id === peerId)?.name ?? 'A nearby device'
+
+    const manager = new PeerManager((to, data) => signalingRef.current?.send({ type: 'signal', to, data }), {
+      transfer: (transfer) => {
+        setTransfers((current) => ({ ...current, [transfer.peerId]: transfer }))
+        if (transfer.status === 'failed' && transfer.error) setToast(transfer.error)
+        if (transfer.status === 'declined') setToast(transfer.error || 'They declined the files.')
+        if (terminal.has(transfer.status)) {
+          window.setTimeout(() => setTransfers((current) => {
+            const latest = current[transfer.peerId]
+            if (latest?.id !== transfer.id || latest.status !== transfer.status) return current
+            const next = { ...current }
+            delete next[transfer.peerId]
+            return next
+          }), 6000)
+        }
+      },
+      offer: (offer) => {
+        setOffers((current) => [...current, offer])
+        navigator.vibrate?.(120)
+      },
+      offerWithdrawn: (offerId) => setOffers((current) => current.filter((offer) => offer.id !== offerId)),
+      file: (file, peerId) => {
+        setReceived((current) => [{ id: makeId(), kind: 'file', file, url: URL.createObjectURL(file), from: peerName(peerId), at: Date.now() }, ...current])
+      },
+      text: (text, peerId) => {
+        const item = { id: makeId(), kind: 'text' as const, text, from: peerName(peerId), at: Date.now() }
+        setReceived((current) => [item, ...current])
+        setShownText(item)
+        navigator.vibrate?.(80)
+      },
+      route: (peerId, route) => setRoutes((current) => {
+        const next = { ...current }
+        if (route) next[peerId] = route
+        else delete next[peerId]
+        return next
+      }),
+    }, () => wifiOnlyRef.current)
+    managerRef.current = manager
+
+    const signaling = new Signaling(
+      () => ({ name: nameRef.current, device: thisDevice, detail: describeDevice(), secret: tabSecret() }),
+      (message) => {
+        switch (message.type) {
+          case 'welcome': {
+            manager.setSelf(message.id)
+            const fromUrl = takeUrlParam('room')
+            const saved = storageGet(() => sessionStorage, roomStorage)
+            if (fromUrl) {
+              joinSourceRef.current = 'url'
+              signaling.send({ type: 'join-room', code: fromUrl })
+            } else if (saved) {
+              joinSourceRef.current = 'saved'
+              signaling.send({ type: 'join-room', code: saved })
+            } else if (thisDevice !== 'phone') {
+              // Computers show a pairing QR right away so a phone can scan it.
+              signaling.send({ type: 'create-room' })
+            }
+            break
+          }
+          case 'peers':
+            peersRef.current = message.peers
+            setPeers(message.peers)
+            manager.sync(new Set(message.peers.map((peer) => peer.id)))
+            break
+          case 'room':
+            joinSourceRef.current = null
+            setRoom(message.code)
+            setRoomError('')
+            storageSet(() => sessionStorage, roomStorage, message.code)
+            if (message.code) setRoomInput('')
+            break
+          case 'room-error':
+            if (joinSourceRef.current === 'saved') {
+              storageSet(() => sessionStorage, roomStorage, null)
+              if (thisDevice !== 'phone') signaling.send({ type: 'create-room' })
+            } else {
+              setRoomError(message.error)
+            }
+            joinSourceRef.current = null
+            break
+          case 'signal':
+            manager.handleSignal(message.from, message.data)
+            break
+        }
+      },
+      setOnline,
+    )
+    signalingRef.current = signaling
+
+    return () => {
+      signaling.close()
+      manager.closeAll()
+    }
   }, [])
 
   useEffect(() => {
-    void refreshFiles()
-    const timer = window.setInterval(() => void refreshFiles(), 4000)
-    return () => window.clearInterval(timer)
-  }, [refreshFiles])
+    fetch('/api/info').then((response) => response.json()).then((info: { addresses: string[] }) => setAddresses(info.addresses)).catch(() => {})
+  }, [])
+
+  // Files shared into the installed app from another app's share sheet (Android).
+  useEffect(() => {
+    if (takeUrlParam('shared') === null || !('caches' in window)) return
+    void (async () => {
+      const cache = await caches.open(shareCache)
+      const files: File[] = []
+      let text = ''
+      for (const request of await cache.keys()) {
+        const response = await cache.match(request)
+        if (!response) continue
+        if (new URL(request.url).pathname === '/shared/text') {
+          text = await response.text()
+          continue
+        }
+        const blob = await response.blob()
+        files.push(new File([blob], decodeURIComponent(response.headers.get('x-file-name') || 'shared-file'), { type: blob.type }))
+      }
+      await caches.delete(shareCache)
+      if (files.length || text) setStaged({ files, text: files.length ? '' : text })
+    })()
+  }, [])
+
+  useEffect(() => {
+    const connection = (navigator as Navigator & { connection?: EventTarget }).connection
+    const update = () => setCellular(onCellular())
+    connection?.addEventListener('change', update)
+    return () => connection?.removeEventListener('change', update)
+  }, [])
+
+  useEffect(() => {
+    document.title = offers.length ? `(${offers.length}) Incoming files · PexyDrop` : 'PexyDrop'
+  }, [offers.length])
 
   useEffect(() => {
     if (!toast) return
-    const timer = window.setTimeout(() => setToast(''), 3200)
+    const timer = window.setTimeout(() => setToast(''), 4200)
     return () => window.clearTimeout(timer)
   }, [toast])
 
-  const transferUrl = useMemo(() => {
-    if (!serverInfo || !apiKey) return ''
-    const address = serverInfo.addresses[0]
-    const url = new URL(serverInfo.publicUrl || window.location.href)
-    if (address) {
-      url.hostname = address
-      url.port = String(serverInfo.port === 4173 && window.location.port ? window.location.port : serverInfo.port)
-    } else if (!serverInfo.publicUrl) {
-      url.port = window.location.port
+  // Paste files or text anywhere on the page to queue them for sending.
+  useEffect(() => {
+    const onPaste = (event: ClipboardEvent) => {
+      if (event.target instanceof HTMLInputElement || event.target instanceof HTMLTextAreaElement) return
+      const files = Array.from(event.clipboardData?.files ?? [])
+      const text = event.clipboardData?.getData('text') ?? ''
+      if (files.length) setStaged({ files, text: '' })
+      else if (text.trim()) setStaged({ files: [], text })
     }
-    url.search = ''
-    url.hash = ''
-    url.searchParams.set('key', apiKey)
-    return url.toString()
-  }, [apiKey, serverInfo])
+    document.addEventListener('paste', onPaste)
+    return () => document.removeEventListener('paste', onPaste)
+  }, [])
 
-  const totalBytes = files.reduce((sum, file) => sum + file.size, 0)
-  const filteredFiles = files.filter((file) => file.name.toLowerCase().includes(search.toLowerCase()))
+  const pairUrl = useMemo(() => {
+    if (!room) return ''
+    const isLoopback = ['localhost', '127.0.0.1', '[::1]'].includes(location.hostname)
+    const base = isLoopback && addresses[0] ? `${location.protocol}//${addresses[0]}:${location.port}` : location.origin
+    return `${base}/?room=${room}`
+  }, [addresses, room])
 
-  function uploadFiles(selected: FileList | File[]) {
-    if (!selected.length) return
-    const form = new FormData()
-    Array.from(selected).forEach((file) => form.append('files', file))
-    const xhr = new XMLHttpRequest()
-    xhr.open('POST', '/api/files')
-    xhr.setRequestHeader('x-transfer-key', apiKey)
-    xhr.upload.onprogress = (event) => {
-      if (event.lengthComputable) setUploadProgress(Math.round((event.loaded / event.total) * 100))
-    }
-    xhr.onload = () => {
-      setIsUploading(false)
-      if (xhr.status >= 200 && xhr.status < 300) {
-        const uploaded: TransferFile[] = JSON.parse(xhr.responseText)
-        setToast(`${uploaded.length} ${uploaded.length === 1 ? 'file' : 'files'} added to this device`)
-        void refreshFiles()
-      } else {
-        let message = 'Upload failed. Check your connection and try again.'
-        try { message = JSON.parse(xhr.responseText).error || message } catch { /* Keep fallback message. */ }
-        setToast(message)
-      }
-      setUploadProgress(0)
-    }
-    xhr.onerror = () => {
-      setIsUploading(false)
-      setToast('Connection interrupted. Your original files are unchanged.')
-      setUploadProgress(0)
-    }
-    setIsUploading(true)
-    setUploadProgress(0)
-    xhr.send(form)
+  const siteAddress = useMemo(() => {
+    const isLoopback = ['localhost', '127.0.0.1', '[::1]'].includes(location.hostname)
+    return isLoopback && addresses[0] ? `${addresses[0]}:${location.port}` : location.host
+  }, [addresses])
+
+  const offer = offers[0]
+  const offerFrom = offer ? peers.find((peer) => peer.id === offer.peerId) : undefined
+
+  function sendFiles(peerId: string, files: File[]) {
+    if (!files.length) return
+    managerRef.current?.get(peerId).sendFiles(files).catch((error: Error) => setToast(error.message))
   }
 
-  async function deleteFile(file: TransferFile) {
-    try {
-      await request(`/api/files/${file.id}`, { method: 'DELETE' })
-      setFiles((current) => current.filter((item) => item.id !== file.id))
-      setToast(`${file.name} removed`)
-    } catch (error) {
-      setToast(error instanceof Error ? error.message : 'Could not remove file')
+  function sendText(peerId: string, text: string) {
+    return managerRef.current?.get(peerId).sendText(text)
+  }
+
+  function chooseFor(peer: RemotePeer) {
+    const active = transfers[peer.id]
+    if (active && !terminal.has(active.status)) return
+    if (staged?.files.length) {
+      sendFiles(peer.id, staged.files)
+      setStaged(null)
+      return
     }
-  }
-
-  async function downloadAll() {
-    const link = document.createElement('a')
-    link.href = `/api/archive?key=${encodeURIComponent(apiKey)}`
-    link.download = 'pexydrop.zip'
-    link.click()
-  }
-
-  async function copyLink() {
-    try {
-      await navigator.clipboard.writeText(transferUrl)
-      setCopied(true)
-      window.setTimeout(() => setCopied(false), 1800)
-    } catch {
-      setToast('Clipboard access is unavailable in this browser')
+    if (staged?.text) {
+      void sendText(peer.id, staged.text)?.then(() => setToast(`Text sent to ${peer.name}`), (error: Error) => setToast(error.message))
+      setStaged(null)
+      return
     }
+    pickTargetRef.current = peer.id
+    fileInputRef.current?.click()
   }
 
-  async function unlockTransfers(event: FormEvent<HTMLFormElement>) {
+  function dropOnPage(event: DragEvent) {
     event.preventDefault()
-    setIsUnlocking(true)
-    try {
-      const response = await fetch('/api/info', { headers: { 'x-transfer-password': passwordInput } })
-      const info: ServerInfo = await response.json()
-      if (info.requiresPassword || !info.pairingKey) {
-        setToast(info.setupRequired ? 'Transfer access has not been configured by the host yet.' : 'That transfer password did not unlock this session.')
-        return
-      }
-      sessionStorage.setItem(passwordStorage, passwordInput)
-      localStorage.setItem(keyStorage, info.pairingKey)
-      setAccessPassword(passwordInput)
-      setApiKey(info.pairingKey)
-      setServerInfo(info)
-      setRequiresPassword(false)
-    } catch {
-      setToast('Could not reach the transfer service. Try again.')
-    } finally {
-      setIsUnlocking(false)
+    setPageDrag(false)
+    const files = Array.from(event.dataTransfer.files)
+    if (!files.length) return
+    if (peers.length === 1) sendFiles(peers[0].id, files)
+    else setStaged({ files, text: '' })
+  }
+
+  function respond(accept: boolean) {
+    if (!offer) return
+    managerRef.current?.get(offer.peerId).respond(offer.id, accept)
+    setOffers((current) => current.filter((item) => item.id !== offer.id))
+  }
+
+  function saveName(event: FormEvent) {
+    event.preventDefault()
+    const next = nameDraft.trim().slice(0, 32)
+    if (next) {
+      setName(next)
+      saveDeviceName(next)
+      signalingRef.current?.send({ type: 'rename', name: next })
+    } else {
+      setNameDraft(name)
+    }
+    setEditingName(false)
+  }
+
+  function toggleWifiOnly() {
+    const next = !wifiOnly
+    setWifiOnly(next)
+    storageSet(() => localStorage, wifiOnlyStorage, String(next))
+  }
+
+  function joinRoom(event: FormEvent) {
+    event.preventDefault()
+    const code = roomInput.toUpperCase().replace(/[^A-Z0-9]/g, '')
+    if (code.length !== 6) return setRoomError('Codes are 6 characters long.')
+    joinSourceRef.current = 'manual'
+    signalingRef.current?.send({ type: 'join-room', code })
+  }
+
+  async function copy(id: string, text: string) {
+    if (await copyText(text)) {
+      setCopiedId(id)
+      window.setTimeout(() => setCopiedId((current) => (current === id ? '' : current)), 1600)
+    } else {
+      setToast('Copying is not available in this browser.')
     }
   }
+
+  async function share(file: File) {
+    try {
+      await navigator.share({ files: [file] })
+    } catch (error) {
+      if ((error as Error).name !== 'AbortError') setToast('Sharing is not available for this file.')
+    }
+  }
+
+  function saveAll() {
+    received.forEach((item, index) => {
+      if (item.kind !== 'file') return
+      window.setTimeout(() => {
+        const link = document.createElement('a')
+        link.href = item.url
+        link.download = item.file.name
+        link.click()
+      }, index * 300)
+    })
+  }
+
+  function clearReceived() {
+    for (const item of received) if (item.kind === 'file') URL.revokeObjectURL(item.url)
+    setReceived([])
+  }
+
+  const receivedFiles = received.filter((item) => item.kind === 'file')
+  const canShareFiles = typeof navigator.canShare === 'function'
+  const SelfIcon = deviceIcon(thisDevice)
+  const hint = thisDevice === 'phone' || thisDevice === 'tablet' ? 'Tap to send' : 'Click or drop files'
 
   return (
-    <main className="app-shell" onDragEnter={(event) => { event.preventDefault(); setIsDragging(true) }}>
+    <main
+      className="app-shell"
+      onDragEnter={(event) => { if (event.dataTransfer.types.includes('Files')) { event.preventDefault(); setPageDrag(true) } }}
+      onDragOver={(event) => event.preventDefault()}
+      onDrop={dropOnPage}
+    >
+      <input
+        ref={fileInputRef}
+        className="file-input"
+        type="file"
+        multiple
+        onChange={(event) => {
+          const target = pickTargetRef.current
+          if (target && event.target.files) sendFiles(target, Array.from(event.target.files))
+          pickTargetRef.current = null
+          event.target.value = ''
+        }}
+      />
+
       <header className="topbar">
         <a className="brand" href="/" aria-label="PexyDrop home">
-          <span className="brand-mark"><ArrowLeftRight size={19} strokeWidth={2.5} /></span>
+          <span className="brand-mark"><ArrowLeftRight size={18} strokeWidth={2.5} /></span>
           <span>pexy<span className="brand-light">drop</span></span>
         </a>
-        <div className="topbar-right">
-          <span className={`connection-pill ${isOnline ? 'is-online' : ''}`}>
-            <span className="status-dot" />
-            {isOnline ? (serverInfo && serverInfo.addresses.length === 0 ? 'Hosted session ready' : 'Ready on this network') : 'Connecting'}
-          </span>
-          <span className="topbar-divider" />
-          <span className="device-label"><Laptop size={16} /> This device</span>
-        </div>
+        <span className={`connection-pill ${online ? 'is-online' : ''}`} role="status">
+          <span className="status-dot" />
+          {online ? 'Online' : 'Connecting…'}
+        </span>
       </header>
 
-      <section className="intro-row">
-        <div>
-          <p className="eyebrow"><span /> PRIVATE LOCAL TRANSFER</p>
-          <h1>Move files.<br /><span>Keep your flow.</span></h1>
-          <p className="intro-copy">{serverInfo && serverInfo.addresses.length === 0 ? 'A private, passphrase-protected file relay.' : 'A direct bridge between your devices. No accounts, no cloud detours.'}</p>
+      {cellular && (
+        <div className="notice is-warning" role="alert">
+          <SignalIcon size={17} />
+          <span><strong>You're on mobile data.</strong> Connect to the same Wi-Fi as your other device so transfers are fast and don't use your data plan.</span>
         </div>
-        <div className="network-note"><ShieldCheck size={17} /><span>{serverInfo && serverInfo.addresses.length === 0 ? 'Transfers pass through the host' : 'Files stay on your network'}</span></div>
-      </section>
+      )}
 
       <section className="workspace-grid">
         <div className="main-column">
-          <div
-            className={`drop-zone ${isDragging ? 'is-dragging' : ''} ${isUploading ? 'is-uploading' : ''}`}
-            onDragOver={(event) => { event.preventDefault(); setIsDragging(true) }}
-            onDragLeave={(event) => { if (!event.currentTarget.contains(event.relatedTarget as Node)) setIsDragging(false) }}
-            onDrop={(event) => { event.preventDefault(); setIsDragging(false); uploadFiles(event.dataTransfer.files) }}
-            onDragEnd={() => setIsDragging(false)}
-          >
-            <input ref={inputRef} className="file-input" type="file" multiple onChange={(event) => { if (event.target.files) uploadFiles(event.target.files); event.target.value = '' }} />
-            <div className="drop-orbit orbit-one" /><div className="drop-orbit orbit-two" />
-            <div className="upload-symbol"><Upload size={22} strokeWidth={1.8} /></div>
-            <div className="drop-copy">
-              <h2>{isUploading ? 'Sending your files' : isDragging ? 'Drop to send' : 'Send files to this device'}</h2>
-              <p>{isUploading ? 'Keep this tab open while the transfer finishes.' : 'Drop them here, or browse your device.'}</p>
+          <section className="intro">
+            <p className="eyebrow"><span /> DEVICE TO DEVICE · OVER YOUR WI-FI</p>
+            <h1>Tap a device.<br /><span>Send anything.</span></h1>
+            <p className="intro-copy">Open PexyDrop on any phone or computer on the same Wi-Fi and it appears below. Files go straight across, encrypted, and are never uploaded to a server.</p>
+          </section>
+
+          {staged && (
+            <div className="notice is-staged">
+              {staged.files.length ? <Upload size={17} /> : <MessageSquareText size={17} />}
+              <span>
+                <strong>{staged.files.length ? `${plural(staged.files.length, 'file')} ready · ${formatBytes(staged.files.reduce((sum, file) => sum + file.size, 0))}` : 'Text ready to send'}</strong>
+                {' '}{peers.length ? 'Choose a device to send to.' : 'Waiting for a device to appear.'}
+              </span>
+              <button className="icon-button" onClick={() => setStaged(null)} aria-label="Clear"><X size={16} /></button>
             </div>
-            <button className="browse-button" onClick={() => inputRef.current?.click()} disabled={isUploading}>
-              {isUploading ? <LoaderCircle className="spin" size={17} /> : <Upload size={17} />}
-              {isUploading ? `${uploadProgress}%` : 'Choose files'}
-            </button>
-            {isUploading && <div className="progress-track"><span style={{ width: `${uploadProgress}%` }} /></div>}
-            <div className="drop-foot"><span>Any file type</span><i /><span>Large files supported</span><i /><span>Originals stay untouched</span></div>
+          )}
+
+          <div className="section-heading">
+            <h2>Nearby devices</h2>
+            <span className="count">{peers.length}</span>
           </div>
 
-          <div className="files-heading">
-            <div className="files-title">
-              <h2>On this device</h2>
-              <span className="file-count">{files.length}</span>
+          {peers.length > 0 ? (
+            <div className="device-grid">
+              {peers.map((peer) => {
+                const Icon = deviceIcon(peer.device)
+                const transfer = transfers[peer.id]
+                const active = transfer && !terminal.has(transfer.status)
+                const progress = transfer && transfer.total ? transfer.transferred / transfer.total : 0
+                const route = routes[peer.id]
+                return (
+                  <article
+                    key={peer.id}
+                    className={`device-card ${dragTarget === peer.id ? 'is-drop-target' : ''} ${active ? 'is-busy' : ''} ${transfer?.status === 'done' ? 'is-done' : ''}`}
+                    onDragOver={(event) => { event.preventDefault(); event.stopPropagation(); setDragTarget(peer.id) }}
+                    onDragLeave={() => setDragTarget(null)}
+                    onDrop={(event) => {
+                      event.preventDefault()
+                      event.stopPropagation()
+                      setDragTarget(null)
+                      setPageDrag(false)
+                      sendFiles(peer.id, Array.from(event.dataTransfer.files))
+                    }}
+                  >
+                    <button className="device-main" onClick={() => chooseFor(peer)} disabled={active} aria-label={`Send files to ${peer.name}`}>
+                      <span className="device-avatar">
+                        {active && (transfer.status === 'sending' || transfer.status === 'receiving') && <ProgressRing value={progress} />}
+                        {active && (transfer.status === 'connecting' || transfer.status === 'waiting') && <span className="pulse-ring" />}
+                        {transfer?.status === 'done' ? <Check size={26} /> : <Icon size={26} strokeWidth={1.7} />}
+                      </span>
+                      <span className="device-name" title={peer.name}>{peer.name}</span>
+                      <span className="device-detail">{peer.detail || 'Web browser'}</span>
+                      <span className={`device-status status-${transfer?.status ?? 'idle'}`}>{transfer ? describeTransfer(transfer) : hint}</span>
+                    </button>
+                    <div className="device-foot">
+                      <span className={`route-badge ${route === 'internet' ? 'is-internet' : ''}`}>
+                        {route === 'internet' ? <><Globe size={12} /> Internet</> : route === 'local' ? <><Wifi size={12} /> Wi-Fi direct</> : peer.via === 'code' ? <><Link2 size={12} /> Paired</> : <><Wifi size={12} /> Same network</>}
+                      </span>
+                      {active
+                        ? <button className="mini-button" onClick={() => managerRef.current?.get(peer.id).cancel(transfer.id)}>Cancel</button>
+                        : <button className="mini-button" onClick={() => { setComposeFor(peer); setDraft('') }} aria-label={`Send text to ${peer.name}`}><MessageSquareText size={14} /> Text</button>}
+                    </div>
+                  </article>
+                )
+              })}
             </div>
-            <div className="files-actions">
-              <span className="storage-total"><HardDrive size={15} /> {formatBytes(totalBytes)}</span>
-              <button className="icon-button refresh-button" aria-label="Refresh file list" title="Refresh" onClick={() => void refreshFiles()}><RefreshCw size={16} /></button>
-              {files.length > 0 && <button className="download-all" onClick={() => void downloadAll()}><Download size={15} /> Download all</button>}
+          ) : (
+            <div className="empty-radar">
+              <div className="radar" aria-hidden="true"><span /><span /><span /><SelfIcon size={24} /></div>
+              <p>{online ? 'Looking for devices…' : 'Connecting to PexyDrop…'}</p>
+              <span>Open <strong>{siteAddress}</strong> on your other device while it's on this Wi-Fi, or pair with the code{thisDevice === 'phone' ? ' below' : ''}.</span>
             </div>
-          </div>
+          )}
 
-          {files.length > 0 && <label className="search-box"><Search size={16} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Find a file" /><kbd>⌘ K</kbd></label>}
-
-          <div className="file-list">
-            {filteredFiles.map((file, index) => {
-              const Icon = fileIcon(file.type)
-              return (
-                <article className="file-row" key={file.id} style={{ animationDelay: `${Math.min(index, 8) * 35}ms` }}>
-                  <div className="file-icon"><Icon size={19} strokeWidth={1.8} /></div>
-                  <div className="file-meta"><p title={file.name}>{file.name}</p><span>{formatBytes(file.size)} <i /> {new Date(file.createdAt).toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })}</span></div>
-                  <span className="received-tag"><Check size={13} /> Ready</span>
-                  <a className="icon-button file-action" href={`/api/files/${file.id}/download?key=${encodeURIComponent(apiKey)}`} download={file.name} aria-label={`Download ${file.name}`} title="Download"><ArrowDownToLine size={17} /></a>
-                  <button className="icon-button file-action remove-action" onClick={() => void deleteFile(file)} aria-label={`Remove ${file.name}`} title="Remove"><Trash2 size={16} /></button>
-                </article>
-              )
-            })}
-            {files.length === 0 && <div className="empty-state"><div className="empty-icon"><File size={21} /></div><p>No files here yet</p><span>Files sent from your phone will show up here.</span></div>}
-            {files.length > 0 && filteredFiles.length === 0 && <div className="no-results">No files match “{search}”.</div>}
-          </div>
+          {received.length > 0 && (
+            <section className="received">
+              <div className="section-heading">
+                <h2>Received</h2>
+                <span className="count">{received.length}</span>
+                <div className="heading-actions">
+                  {receivedFiles.length > 1 && <button className="ghost-button" onClick={saveAll}><Download size={14} /> Save all</button>}
+                  <button className="ghost-button" onClick={clearReceived}><Trash2 size={14} /> Clear</button>
+                </div>
+              </div>
+              <div className="received-list">
+                {received.map((item) => {
+                  if (item.kind === 'text') {
+                    return (
+                      <article className="received-row" key={item.id}>
+                        <span className="file-icon"><MessageSquareText size={18} /></span>
+                        <div className="file-meta"><p title={item.text}>{item.text}</p><span>Text from {item.from}</span></div>
+                        {isLink(item.text) && <a className="icon-button row-action" href={item.text.trim()} target="_blank" rel="noreferrer" aria-label="Open link" title="Open link"><ExternalLink size={16} /></a>}
+                        <button className="icon-button row-action" onClick={() => void copy(item.id, item.text)} aria-label="Copy text" title="Copy">{copiedId === item.id ? <Check size={16} /> : <Copy size={16} />}</button>
+                      </article>
+                    )
+                  }
+                  const Icon = fileIcon(item.file.type)
+                  return (
+                    <article className="received-row" key={item.id}>
+                      {item.file.type.startsWith('image/')
+                        ? <img className="thumb" src={item.url} alt="" />
+                        : <span className="file-icon"><Icon size={18} /></span>}
+                      <div className="file-meta"><p title={item.file.name}>{item.file.name}</p><span>{formatBytes(item.file.size)} · from {item.from}</span></div>
+                      {canShareFiles && navigator.canShare({ files: [item.file] }) && (
+                        <button className="icon-button row-action" onClick={() => void share(item.file)} aria-label={`Share ${item.file.name}`} title="Share or save to Photos"><Share2 size={16} /></button>
+                      )}
+                      <a className="save-button" href={item.url} download={item.file.name}><Download size={15} /> Save</a>
+                    </article>
+                  )
+                })}
+              </div>
+            </section>
+          )}
         </div>
 
-        <aside className="pair-panel">
-          <div className="pair-topline"><span className="pair-icon"><Smartphone size={17} /></span><span>PAIR A DEVICE</span><span className="pair-step">01 / 01</span></div>
-          <h2>Make the<br />connection.</h2>
-          <p className="pair-description">{serverInfo && serverInfo.addresses.length === 0 ? 'Open this private session link on the device you want to pair.' : 'Scan with your phone camera. Both devices should be on the same Wi-Fi.'}</p>
-          <div className="qr-frame">
-            {transferUrl ? <QRCodeSVG value={transferUrl} size={172} level="M" bgColor="#ffffff" fgColor="#182923" includeMargin={false} /> : <div className="qr-loading"><LoaderCircle className="spin" size={24} /></div>}
-            <span className="qr-corner corner-tl" /><span className="qr-corner corner-tr" /><span className="qr-corner corner-bl" /><span className="qr-corner corner-br" />
-          </div>
-          <div className="pair-divider"><span /><p>OR OPEN THIS LINK</p><span /></div>
-          <button className="link-copy" onClick={() => void copyLink()} disabled={!transferUrl}>
-            <span className="link-glyph"><Wifi size={15} /></span>
-            <span className="link-address">{serverInfo?.publicUrl ? new URL(serverInfo.publicUrl).host : serverInfo?.addresses[0] ? `${serverInfo.addresses[0]}:${window.location.port || serverInfo.port}` : serverInfo ? window.location.host : 'Waiting for network address'}</span>
-            <span className="copy-icon">{copied ? <Check size={16} /> : <Copy size={15} />}</span>
-          </button>
-          <p className="pair-security"><ShieldCheck size={15} />{serverInfo && serverInfo.addresses.length === 0 ? 'Access requires the host-shared passphrase.' : ' Session link for devices on your network.'}</p>
-          <div className="pair-bottom"><div className="device-avatars"><span><Laptop size={14} /></span><span><Smartphone size={14} /></span></div><span>Ready for phone ↔ laptop</span><span className="pair-online-dot" /></div>
+        <aside className="side-column">
+          <section className="panel identity">
+            <span className="identity-avatar"><SelfIcon size={20} /></span>
+            <div className="identity-copy">
+              <span className="label">You appear as</span>
+              {editingName ? (
+                <form onSubmit={saveName}>
+                  <input value={nameDraft} onChange={(event) => setNameDraft(event.target.value)} onBlur={saveName} maxLength={32} autoFocus aria-label="Device name" />
+                </form>
+              ) : (
+                <button className="name-button" onClick={() => { setNameDraft(name); setEditingName(true) }}>{name} <Pencil size={13} /></button>
+              )}
+            </div>
+          </section>
+
+          <section className="panel pair-panel">
+            <div className="panel-topline"><Link2 size={15} /><span>PAIR WITH A CODE</span></div>
+            <p className="panel-copy">Not seeing your device? Different Wi-Fi bands or a VPN can hide it. Scan this QR code or enter the code on the other device.</p>
+            {room ? (
+              <>
+                <div className="qr-frame">
+                  <QRCodeSVG value={pairUrl} size={164} level="M" bgColor="#ffffff" fgColor="#2a1a4a" />
+                </div>
+                <button className="code-display" onClick={() => void copy('room', pairUrl)} title="Copy pairing link">
+                  <span>{formatCode(room)}</span>
+                  {copiedId === 'room' ? <Check size={15} /> : <Copy size={15} />}
+                </button>
+                <button className="text-button" onClick={() => signalingRef.current?.send({ type: 'leave-room' })}><LogOut size={13} /> Stop using this code</button>
+              </>
+            ) : (
+              <button className="secondary-button" onClick={() => signalingRef.current?.send({ type: 'create-room' })} disabled={!online}>Show a pairing code</button>
+            )}
+            <form className="join-form" onSubmit={joinRoom}>
+              <input
+                value={roomInput}
+                onChange={(event) => { setRoomInput(event.target.value.toUpperCase()); setRoomError('') }}
+                placeholder="Enter code"
+                maxLength={7}
+                autoCapitalize="characters"
+                autoComplete="off"
+                spellCheck={false}
+                aria-label="Pairing code"
+              />
+              <button type="submit" disabled={!online || !roomInput.trim()}>Join</button>
+            </form>
+            {roomError && <p className="form-error">{roomError}</p>}
+          </section>
+
+          <section className="panel settings">
+            <label className="toggle-row">
+              <span>
+                <strong>Wi-Fi only</strong>
+                <small>Refuse transfers that would travel over the internet or mobile data.</small>
+              </span>
+              <input type="checkbox" checked={wifiOnly} onChange={toggleWifiOnly} />
+              <span className="toggle" aria-hidden="true" />
+            </label>
+            <p className="privacy-note"><ShieldCheck size={15} /> Files are encrypted in transit and go directly between devices. You approve every incoming transfer.</p>
+          </section>
         </aside>
       </section>
 
-      <footer className="footer"><span><span className="footer-dot" />{serverInfo && serverInfo.addresses.length === 0 ? ' PASSWORD-PROTECTED RELAY' : ' DIRECT · PRIVATE · YOURS'}</span><span>PexyDrop <i /> {serverInfo && serverInfo.addresses.length === 0 ? 'Hosted transfer session' : 'Built for your local network'}</span></footer>
+      <footer className="footer"><span><span className="footer-dot" /> DIRECT · ENCRYPTED · NO UPLOADS</span><span>PexyDrop</span></footer>
 
-      {isDragging && <div className="drag-overlay" onDragOver={(event) => event.preventDefault()} onDrop={(event) => { event.preventDefault(); setIsDragging(false); uploadFiles(event.dataTransfer.files) }}><div><Upload size={30} /><strong>Drop to send</strong><span>Files will be available on every paired device</span></div></div>}
-      {toast && <div className="toast"><span><Check size={15} /></span>{toast}<button onClick={() => setToast('')} aria-label="Dismiss notification"><X size={15} /></button></div>}
-      {requiresPassword && serverInfo && <div className="access-backdrop">
-        <section className="access-dialog" role="dialog" aria-modal="true" aria-labelledby="access-title">
-          <span className="access-mark"><ShieldCheck size={20} /></span>
-          <p className="eyebrow"><span /> PRIVATE TRANSFER SESSION</p>
-          <h2 id="access-title">{serverInfo.setupRequired ? 'Access is not configured.' : 'Unlock PexyDrop.'}</h2>
-          <p>{serverInfo.setupRequired ? 'The host must set TRANSFER_PASSWORD in the deployment settings before this service can accept transfers.' : 'Enter the transfer password shared by the person hosting this session.'}</p>
-          {!serverInfo.setupRequired && <form onSubmit={(event) => void unlockTransfers(event)}>
-            <label htmlFor="transfer-password">Transfer password</label>
-            <input id="transfer-password" type="password" autoComplete="current-password" value={passwordInput} onChange={(event) => setPasswordInput(event.target.value)} autoFocus required />
-            <button type="submit" disabled={isUnlocking}>{isUnlocking ? <LoaderCircle className="spin" size={16} /> : <ShieldCheck size={16} />}{isUnlocking ? 'Checking' : 'Unlock transfers'}</button>
-          </form>}
-          <span className="access-foot">Files are stored only on the PexyDrop server.</span>
-        </section>
-      </div>}
+      {pageDrag && (
+        <div className="drag-overlay" onDragLeave={(event) => { if (event.target === event.currentTarget) setPageDrag(false) }}>
+          <div><Upload size={30} /><strong>{peers.length === 1 ? `Drop to send to ${peers[0].name}` : 'Drop to queue files'}</strong><span>{peers.length > 1 ? 'Then pick a device, or drop straight onto one.' : 'They go straight to the other device.'}</span></div>
+        </div>
+      )}
+
+      {offer && (
+        <div className="backdrop">
+          <section className="dialog" role="dialog" aria-modal="true" aria-labelledby="offer-title">
+            <span className="dialog-mark"><Download size={20} /></span>
+            <p className="eyebrow"><span /> INCOMING</p>
+            <h2 id="offer-title">{offerFrom?.name ?? 'A nearby device'} wants to send you {plural(offer.files.length, 'file')}</h2>
+            <p className="dialog-copy">{formatBytes(offer.total)} total{routes[offer.peerId] === 'internet' ? ' · over the internet' : ' · over your Wi-Fi'}</p>
+            <ul className="offer-files">
+              {offer.files.slice(0, 4).map((file, index) => {
+                const Icon = fileIcon(file.type)
+                return <li key={index}><Icon size={15} /><span>{file.name}</span><small>{formatBytes(file.size)}</small></li>
+              })}
+              {offer.files.length > 4 && <li className="more">+ {plural(offer.files.length - 4, 'more file')}</li>}
+            </ul>
+            <div className="dialog-actions">
+              <button className="secondary-button" onClick={() => respond(false)}>Decline</button>
+              <button className="primary-button" onClick={() => respond(true)} autoFocus><Check size={16} /> Accept</button>
+            </div>
+          </section>
+        </div>
+      )}
+
+      {!offer && shownText && (
+        <div className="backdrop" onClick={(event) => { if (event.target === event.currentTarget) setShownText(null) }}>
+          <section className="dialog" role="dialog" aria-modal="true" aria-labelledby="text-title">
+            <span className="dialog-mark"><MessageSquareText size={20} /></span>
+            <h2 id="text-title">Text from {shownText.from}</h2>
+            <pre className="text-body">{shownText.text}</pre>
+            <div className="dialog-actions">
+              <button className="secondary-button" onClick={() => setShownText(null)}>Close</button>
+              {isLink(shownText.text)
+                ? <a className="primary-button" href={shownText.text.trim()} target="_blank" rel="noreferrer" onClick={() => setShownText(null)}><ExternalLink size={16} /> Open link</a>
+                : <button className="primary-button" onClick={() => void copy('dialog', shownText.text)}>{copiedId === 'dialog' ? <Check size={16} /> : <Copy size={16} />} {copiedId === 'dialog' ? 'Copied' : 'Copy'}</button>}
+            </div>
+          </section>
+        </div>
+      )}
+
+      {composeFor && (
+        <div className="backdrop" onClick={(event) => { if (event.target === event.currentTarget) setComposeFor(null) }}>
+          <form
+            className="dialog"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="compose-title"
+            onSubmit={(event) => {
+              event.preventDefault()
+              const target = composeFor
+              if (!draft.trim()) return
+              void sendText(target.id, draft)?.then(() => setToast(`Text sent to ${target.name}`), (error: Error) => setToast(error.message))
+              setComposeFor(null)
+            }}
+          >
+            <span className="dialog-mark"><MessageSquareText size={20} /></span>
+            <h2 id="compose-title">Send text to {composeFor.name}</h2>
+            <textarea value={draft} onChange={(event) => setDraft(event.target.value)} placeholder="Paste a link, a note, a code…" rows={5} autoFocus />
+            <div className="dialog-actions">
+              <button type="button" className="secondary-button" onClick={() => setComposeFor(null)}>Cancel</button>
+              <button type="submit" className="primary-button" disabled={!draft.trim()}><Send size={15} /> Send</button>
+            </div>
+          </form>
+        </div>
+      )}
+
+      {toast && <div className="toast" role="status">{toast}<button onClick={() => setToast('')} aria-label="Dismiss notification"><X size={15} /></button></div>}
     </main>
   )
 }

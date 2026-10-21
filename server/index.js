@@ -1,159 +1,161 @@
-import archiver from 'archiver'
 import crypto from 'node:crypto'
-import { createReadStream } from 'node:fs'
-import { mkdir, readdir, readFile, stat, unlink, writeFile } from 'node:fs/promises'
+import { createServer } from 'node:http'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import express from 'express'
-import multer from 'multer'
+import { WebSocketServer } from 'ws'
 
-const root = path.dirname(fileURLToPath(import.meta.url))
-const appRoot = path.resolve(root, '..')
-const storagePath = process.env.TRANSFER_STORAGE || path.join(os.tmpdir(), 'pexydrop-files')
+// PexyDrop's server never sees file contents. It only introduces devices to each
+// other and relays WebRTC handshake messages; files travel device to device.
+
+const appRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const port = Number(process.env.PORT || 4173)
-const pairingKey = crypto.randomBytes(24).toString('hex')
-const transferPassword = process.env.TRANSFER_PASSWORD || ''
-const publicUrl = process.env.PUBLIC_URL || process.env.RENDER_EXTERNAL_URL || ''
-const isHosted = Boolean(publicUrl || process.env.RENDER)
-const app = express()
+const isDev = process.env.NODE_ENV === 'development'
+const behindProxy = Boolean(process.env.RENDER || process.env.TRUST_PROXY)
+const roomAlphabet = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789'
+const maxFailedJoins = 8
+// A pairing code outlives a brief disconnect, such as a phone locking its screen.
+const roomGraceMs = 2 * 60_000
 
-await mkdir(storagePath, { recursive: true })
+/** @type {Map<string, Set<Peer>>} */
+const rooms = new Map()
+/** @type {Map<import('ws').WebSocket, Peer>} */
+const peersBySocket = new Map()
 
-const upload = multer({
-  storage: multer.diskStorage({
-    destination: (_req, _file, callback) => callback(null, storagePath),
-    filename: (_req, _file, callback) => callback(null, `${crypto.randomUUID()}.data`),
-  }),
-})
+/**
+ * @typedef {{ id: string, name: string, device: string, detail: string, socket: import('ws').WebSocket,
+ *   networkRoom: string, codeRoom: string | null, failedJoins: number, alive: boolean }} Peer
+ */
 
-function listFiles() {
-  return readdir(storagePath).then(async (names) => {
-    const files = await Promise.all(names
-      .filter((name) => name.endsWith('.json'))
-      .map(async (name) => {
-        try {
-          return JSON.parse(await readFile(path.join(storagePath, name), 'utf8'))
-        } catch {
-          return null
-        }
-      }))
-    return files.filter(Boolean).sort((a, b) => b.createdAt.localeCompare(a.createdAt))
-  })
-}
-
-app.use('/api', (req, res, next) => {
-  if (req.path === '/info') return next()
-  if (req.get('x-transfer-key') !== pairingKey && req.query.key !== pairingKey) {
-    return res.status(401).json({ error: 'This device is not paired. Scan the current QR code and try again.' })
-  }
-  next()
-})
-
-app.get('/api/info', (req, res) => {
-  const addresses = Object.entries(os.networkInterfaces())
+function lanAddresses() {
+  return Object.entries(os.networkInterfaces())
     .flatMap(([name, interfaces]) => (interfaces ?? []).map((address) => ({ name, address })))
     .filter(({ address }) => address.family === 'IPv4' && !address.internal && !address.address.startsWith('169.254.'))
     .sort((first, second) => Number(/wi-?fi|wireless|wlan/i.test(second.name)) - Number(/wi-?fi|wireless|wlan/i.test(first.name)))
     .map(({ address }) => address.address)
-  const forwardedAddress = process.env.NODE_ENV === 'development'
-    ? req.get('x-nearby-client-address')
-    : undefined
-  const clientAddress = forwardedAddress || req.socket.remoteAddress || ''
-  const isLocalClient = clientAddress === '::1'
-    || clientAddress === '127.0.0.1'
-    || clientAddress.startsWith('::ffff:127.')
-  const sessionKeyMatches = req.get('x-transfer-key') === pairingKey
-  const passwordMatches = Boolean(transferPassword) && req.get('x-transfer-password') === transferPassword
-  const requiresPassword = (isHosted || Boolean(transferPassword)) && !sessionKeyMatches && !passwordMatches
-  const canPair = requiresPassword ? false : sessionKeyMatches || passwordMatches || isLocalClient
-  res.json({
-    addresses: isHosted ? [] : addresses,
-    pairingKey: canPair ? pairingKey : null,
-    port,
-    publicUrl: publicUrl || null,
-    requiresPassword,
-    setupRequired: isHosted && !transferPassword,
-  })
-})
+}
 
-app.get('/api/files', async (_req, res, next) => {
-  try {
-    res.json(await listFiles())
-  } catch (error) {
-    next(error)
-  }
-})
+function clientAddress(request) {
+  const forwarded = behindProxy ? request.headers['x-forwarded-for']?.split(',')[0]?.trim() : ''
+  return (forwarded || request.socket.remoteAddress || '').replace(/^::ffff:/, '')
+}
 
-app.post('/api/files', upload.array('files'), async (req, res, next) => {
-  try {
-    const uploaded = await Promise.all((req.files ?? []).map(async (file) => {
-      const entry = {
-        id: path.basename(file.filename, '.data'),
-        name: file.originalname,
-        size: file.size,
-        type: file.mimetype,
-        createdAt: new Date().toISOString(),
-      }
-      await writeFile(path.join(storagePath, `${entry.id}.json`), JSON.stringify(entry))
-      return entry
-    }))
-    res.status(201).json(uploaded)
-  } catch (error) {
-    next(error)
-  }
-})
+function isPrivateAddress(address) {
+  return address === '::1'
+    || /^(127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|169\.254\.)/.test(address)
+    || /^f[cd]/i.test(address)
+    || /^fe80:/i.test(address)
+}
 
-app.get('/api/archive', async (_req, res, next) => {
-  try {
-    const files = await listFiles()
-    if (!files.length) return res.status(404).json({ error: 'There are no files to download.' })
-    res.setHeader('Content-Type', 'application/zip')
-    res.setHeader('Content-Disposition', 'attachment; filename="pexydrop.zip"')
-    const archive = archiver('zip', { zlib: { level: 0 } })
-    archive.on('error', (error) => {
-      if (res.headersSent) res.destroy(error)
-      else next(error)
-    })
-    archive.pipe(res)
-    for (const file of files) {
-      archive.append(createReadStream(path.join(storagePath, `${file.id}.data`)), {
-        name: path.basename(file.name.replaceAll('\\', '/')),
+// Devices behind the same router share a public IPv4 address, or an IPv6 /64 prefix.
+// When the server itself runs on the LAN, every private address is the same network.
+function networkKey(address) {
+  if (isPrivateAddress(address)) return 'net:lan'
+  if (address.includes(':')) return `net:${address.split(':').slice(0, 4).join(':')}`
+  return `net:${address}`
+}
+
+function cleanText(value) {
+  return String(value ?? '').replace(/[\u0000-\u001f]/g, '').trim().slice(0, 32)
+}
+
+function cleanName(value) {
+  return cleanText(value) || 'Unnamed device'
+}
+
+function cleanDevice(value) {
+  return ['phone', 'tablet', 'laptop', 'desktop'].includes(value) ? value : 'desktop'
+}
+
+function createRoomCode() {
+  let code
+  do {
+    code = Array.from(crypto.randomBytes(6), (byte) => roomAlphabet[byte % roomAlphabet.length]).join('')
+  } while (rooms.has(`code:${code}`))
+  return code
+}
+
+function send(peer, message) {
+  if (peer.socket.readyState === peer.socket.OPEN) peer.socket.send(JSON.stringify(message))
+}
+
+function visiblePeers(peer) {
+  const visible = new Map()
+  for (const key of [peer.networkRoom, peer.codeRoom]) {
+    if (!key) continue
+    for (const other of rooms.get(key) ?? []) {
+      if (other === peer) continue
+      const existing = visible.get(other.id)
+      visible.set(other.id, {
+        id: other.id,
+        name: other.name,
+        device: other.device,
+        detail: other.detail,
+        via: existing?.via === 'network' || key === peer.networkRoom ? 'network' : 'code',
       })
     }
-    await archive.finalize()
-  } catch (error) {
-    next(error)
   }
+  return [...visible.values()]
+}
+
+function canSee(peer, other) {
+  return peer.networkRoom === other.networkRoom || Boolean(peer.codeRoom && peer.codeRoom === other.codeRoom)
+}
+
+function broadcastRooms(...keys) {
+  const affected = new Set()
+  for (const key of keys) for (const member of rooms.get(key ?? '') ?? []) affected.add(member)
+  for (const member of affected) send(member, { type: 'peers', peers: visiblePeers(member) })
+}
+
+function joinRoom(peer, key) {
+  if (!rooms.has(key)) rooms.set(key, new Set())
+  rooms.get(key).add(peer)
+}
+
+function leaveRoom(peer, key) {
+  const members = rooms.get(key)
+  if (!members) return
+  members.delete(peer)
+  if (members.size) return
+  if (!key.startsWith('code:')) return rooms.delete(key)
+  setTimeout(() => {
+    if (rooms.get(key) === members && !members.size) rooms.delete(key)
+  }, roomGraceMs).unref()
+}
+
+function dropPeer(peer) {
+  const affected = [peer.networkRoom, peer.codeRoom]
+  leaveRoom(peer, peer.networkRoom)
+  if (peer.codeRoom) leaveRoom(peer, peer.codeRoom)
+  peer.codeRoom = null
+  broadcastRooms(...affected)
+}
+
+// Each browser tab keeps a private secret, and its public id is derived from it.
+// That keeps the id stable across reconnects without letting anyone claim it.
+function peerIdFrom(secret) {
+  if (typeof secret !== 'string' || secret.length < 16 || secret.length > 128) return crypto.randomBytes(9).toString('base64url')
+  return crypto.createHash('sha256').update(secret).digest('base64url').slice(0, 12)
+}
+
+function leaveCodeRoom(peer) {
+  const previous = peer.codeRoom
+  if (!previous) return
+  leaveRoom(peer, previous)
+  peer.codeRoom = null
+  broadcastRooms(previous, peer.networkRoom)
+}
+
+const app = express()
+
+app.get('/api/info', (_req, res) => {
+  res.json({ addresses: behindProxy ? [] : lanAddresses(), port })
 })
 
-app.get('/api/files/:id/download', async (req, res, next) => {
-  try {
-    if (!/^[\da-f-]+$/i.test(req.params.id)) return res.sendStatus(404)
-    const metadata = JSON.parse(await readFile(path.join(storagePath, `${req.params.id}.json`), 'utf8'))
-    const filePath = path.join(storagePath, `${req.params.id}.data`)
-    await stat(filePath)
-    res.download(filePath, path.basename(metadata.name), (error) => {
-      if (error && !res.headersSent) next(error)
-    })
-  } catch (error) {
-    if (error.code === 'ENOENT') return res.sendStatus(404)
-    next(error)
-  }
-})
-
-app.delete('/api/files/:id', async (req, res, next) => {
-  try {
-    if (!/^[\da-f-]+$/i.test(req.params.id)) return res.sendStatus(404)
-    await Promise.all([
-      unlink(path.join(storagePath, `${req.params.id}.data`)).catch(() => {}),
-      unlink(path.join(storagePath, `${req.params.id}.json`)).catch(() => {}),
-    ])
-    res.sendStatus(204)
-  } catch (error) {
-    next(error)
-  }
-})
+// The service worker normally answers this; without one, just open the app.
+app.post('/share-target', (_req, res) => res.redirect(303, '/'))
 
 const distPath = path.join(appRoot, 'dist')
 app.use(express.static(distPath))
@@ -161,13 +163,121 @@ app.get('*path', (_req, res, next) => {
   res.sendFile(path.join(distPath, 'index.html'), (error) => error && next(error))
 })
 
-app.use((error, _req, res, _next) => {
-  console.error(error)
-  const status = error instanceof multer.MulterError ? 400 : 500
-  res.status(status).json({ error: status === 400 ? error.message : 'The transfer could not be completed.' })
+const server = createServer(app)
+const wss = new WebSocketServer({ server, path: '/ws', maxPayload: 64 * 1024 })
+
+wss.on('connection', (socket, request) => {
+  /** @type {Peer} */
+  const peer = {
+    id: crypto.randomBytes(9).toString('base64url'),
+    name: 'Unnamed device',
+    device: 'desktop',
+    detail: '',
+    socket,
+    networkRoom: networkKey(clientAddress(request)),
+    codeRoom: null,
+    failedJoins: 0,
+    alive: true,
+  }
+  let introduced = false
+  peersBySocket.set(socket, peer)
+
+  socket.on('pong', () => { peer.alive = true })
+
+  socket.on('message', (raw) => {
+    let message
+    try {
+      message = JSON.parse(String(raw))
+    } catch {
+      return
+    }
+
+    if (message.type === 'hello' && !introduced) {
+      introduced = true
+      peer.id = peerIdFrom(message.secret)
+      for (const [otherSocket, other] of peersBySocket) {
+        if (other === peer || other.id !== peer.id) continue
+        peersBySocket.delete(otherSocket)
+        dropPeer(other)
+        otherSocket.terminate()
+      }
+      peer.name = cleanName(message.name)
+      peer.device = cleanDevice(message.device)
+      peer.detail = cleanText(message.detail)
+      joinRoom(peer, peer.networkRoom)
+      send(peer, { type: 'welcome', id: peer.id })
+      broadcastRooms(peer.networkRoom)
+      return
+    }
+    if (!introduced) return
+
+    switch (message.type) {
+      case 'rename':
+        peer.name = cleanName(message.name)
+        broadcastRooms(peer.networkRoom, peer.codeRoom)
+        break
+      case 'create-room': {
+        leaveCodeRoom(peer)
+        const code = createRoomCode()
+        peer.codeRoom = `code:${code}`
+        joinRoom(peer, peer.codeRoom)
+        send(peer, { type: 'room', code })
+        break
+      }
+      case 'join-room': {
+        const code = String(message.code ?? '').toUpperCase().replace(/[^A-Z0-9]/g, '')
+        const key = `code:${code}`
+        if (!rooms.has(key) || code.length !== 6) {
+          peer.failedJoins += 1
+          send(peer, { type: 'room-error', error: 'That code is not active. Check it and try again.' })
+          if (peer.failedJoins >= maxFailedJoins) socket.close(4008, 'Too many attempts')
+          break
+        }
+        if (peer.codeRoom === key) break
+        leaveCodeRoom(peer)
+        peer.codeRoom = key
+        joinRoom(peer, key)
+        send(peer, { type: 'room', code })
+        broadcastRooms(key)
+        break
+      }
+      case 'leave-room':
+        leaveCodeRoom(peer)
+        send(peer, { type: 'room', code: null })
+        break
+      case 'signal': {
+        // Only relay between devices that can already see each other.
+        const target = [...(rooms.get(peer.networkRoom) ?? []), ...(rooms.get(peer.codeRoom ?? '') ?? [])]
+          .find((other) => other.id === message.to)
+        if (target && canSee(peer, target)) send(target, { type: 'signal', from: peer.id, data: message.data })
+        break
+      }
+    }
+  })
+
+  socket.on('close', () => {
+    if (peersBySocket.get(socket) !== peer) return
+    peersBySocket.delete(socket)
+    dropPeer(peer)
+  })
 })
 
-app.listen(port, process.env.NODE_ENV === 'development' ? '127.0.0.1' : '0.0.0.0', () => {
-  console.log(`PexyDrop API ready on port ${port}`)
-  console.log(`Files are stored temporarily in ${storagePath}`)
+// Drop devices that vanished without closing (phone locked, Wi-Fi lost) and keep
+// hosting proxies from timing out idle sockets.
+setInterval(() => {
+  for (const [socket, peer] of peersBySocket) {
+    if (!peer.alive) {
+      socket.terminate()
+      continue
+    }
+    peer.alive = false
+    socket.ping()
+  }
+}, 25_000).unref()
+
+server.listen(port, isDev ? '127.0.0.1' : '0.0.0.0', () => {
+  console.log(`PexyDrop ready on port ${port}`)
+  if (!behindProxy && !isDev) {
+    for (const address of lanAddresses()) console.log(`  On your Wi-Fi: http://${address}:${port}`)
+  }
 })
